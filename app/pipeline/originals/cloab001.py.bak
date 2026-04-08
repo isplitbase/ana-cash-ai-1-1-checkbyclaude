@@ -1,0 +1,1771 @@
+# create_aggregated_all.json
+#
+# ============================================
+# Colab 用：gpt-4.1-mini を使った BS／製造原価／PL 集計スクリプト（TSV形式・完全版）
+# - data.json を読み込んで 1〜111 行（BS＋製造原価）を集計
+# - さらに PL 112〜120 行（売上〜売上総利益）を集計
+# - さらに PL 121〜154 行（販管費〜当期利益）を集計
+# - temperature=0.0
+# - モデル出力は「全角縦棒｜区切りテキスト」
+# - CSV 出力列順：行番号, 勘定科目, 前々期, 前期, 今期, 区分, 集計方法
+# ============================================
+
+# -------------------------------------
+# openai が未インストール時のみ pip install
+# -------------------------------------
+try:
+    import openai  # noqa: F401
+except ImportError:
+    !pip install -q openai
+    import openai  # noqa: F401
+
+import json
+import csv
+import re
+from pathlib import Path
+from google.colab import userdata
+from openai import OpenAI
+
+# -----------------------------
+# 設定
+# -----------------------------
+MODEL = "gpt-4.1-mini"
+
+# Colab のユーザーシークレットから API キー取得
+api_key = userdata.get('OPENAI_API_KEY2')
+if not api_key:
+    raise RuntimeError("Colab の [⋮]→[ユーザーシークレット] に 'OPENAI_API_KEY2' を登録してください。")
+
+client = OpenAI(api_key=api_key)
+
+# -----------------------------
+# data.json を読み込み（パス固定）
+# -----------------------------
+DATA_PATH = Path("data.json")
+if not DATA_PATH.exists():
+    raise FileNotFoundError("data.json が見つかりません。Colab に data.json をアップロードしてください。")
+
+with DATA_PATH.open(encoding="utf-8") as f:
+    source_data = json.load(f)
+
+# ============================================================
+# 1. BS＋製造原価（1〜111行）の集計
+# ============================================================
+
+# -----------------------------
+# システムプロンプト（1〜111行用）
+# -----------------------------
+system_prompt = """
+あなたは日本の中小企業の決算書（単体）の専門家です。
+
+出力フォーマットに関して、次のルールを絶対に守ってください：
+1. 出力は 111 行のテキストのみとし、それ以外の行や説明文、空行、コメントは一切出力してはいけません。
+2. 各行は次の形式とします（カンマではなく全角の縦棒「｜」で区切る）：
+   行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法
+3. 行番号は 1 〜 111 の整数とし、1 行目は 1、2 行目は 2、…、111 行目は 111 です。
+4. 「今期」「前期」「前々期」は整数のみとし、カンマ区切りや単位（円、千円など）は付けません。金額が無い場合は 0 とします。
+5. 「区分」は、変動費なら "V"、固定費なら "F"、該当しない行は空文字 "" とします。
+6. 区切り文字として使用する全角縦棒「｜」は、フィールドの中（特に「集計方法」）では絶対に使わないでください。
+7. ヘッダ行（「行番号｜勘定科目｜…」など）は出力してはいけません。1 行目からいきなり「1｜現金・預金｜…」の形式で始めてください。
+8. 111 行ちょうど出力してください。112 行以上や 110 行以下になってはいけません。
+また93行には「レンタルリース料」が存在する場合は必ず配置し、当期経費・経費合計など合計行は93〜104に入れない。
+以上のフォーマットに違反すると、後段の処理が失敗します。
+"""
+
+# -----------------------------
+# 行定義などの仕様（1〜111行用）
+# -----------------------------
+spec_text = """
+■目的
+与えられた data.json の BS 部分（貸借対照表）および製造原価報告書に相当する情報を、
+1〜111 行のフォーマットに集計します。
+
+■前提
+- data.json は概ね次のような構造を持つとします（一例）:
+  {
+    "BS": [
+      {
+        "勘定科目": "...",
+        "分類": "...",  // 例: 流動資産, 固定資産, 流動負債, 固定負債, 純資産, 製造原価, 販管費 など
+        "今期": { "金額": 数値または空文字, "page_no": ... },
+        "前期": { "金額": 数値または空文字, "page_no": ... },
+        "前々期": { "金額": 数値または空文字, "page_no": ... }
+      },
+      ...
+    ],
+    "PL": [...],
+    "販売費": [...]
+  }
+
+- 集計対象は原則として "BS" 配列内のデータです。製造原価・労務費・製造経費なども "BS" 又は別セクションから読み取ってください。
+- 金額が空文字の場合は 0 とみなします。
+- 「今期」「前期」「前々期」の金額をそれぞれ集計してください。
+- 「表記ゆれ」（例：什器備品 / 什器・備品、建物附属設備 / 建物付属設備、賃金 / 工員賃金 / 直接工賃金 など）や漢字違いなどは、あなたの判断で同一科目として扱ってください。
+- JSON 内に「合計」行（例：流動資産合計、固定資産合計、資産合計、負債合計、株主資本合計、純資産合計、製造原価合計など）がある場合、それを利用する。自動計算は禁止。
+
+■出力形式（重要）
+- あなたの出力は 111 行のテキストのみです。
+- 各行の形式：
+  行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法
+- 区切りはすべて全角の縦棒「｜」とし、フィールド内では使用しないでください。
+- 「集計方法」は日本語の文章で構いませんが、「｜」は使用禁止です。
+- 「区分」は変動費なら "V"、固定費なら "F"、それ以外の行は ""（空文字）とします。
+- 行番号は 1〜111 で、行番号順に並べてください。
+
+------------------------------------------------------------
+■1〜78 行：BS（貸借対照表）
+------------------------------------------------------------
+
+1,現金・預金,現金と預金、預け金の合計
+2,（うち定期預金）,定期預金の合計
+3,受取手形,受取手形の合計
+4,売掛金,売掛金の合計
+5,当座資産(その他),売買目的有価証券の金額としなければ0
+6,当座資産の合計,""
+7,製品・商品,製品・商品の合計
+8,原材料,原材料の合計
+9,仕掛品,仕掛品の合計
+10,棚卸資産(その他),製品・商品、原材料、仕掛品以外の棚卸資産の合計（該当する勘定科目が１つの場合はその勘定科目を表示）
+11,棚卸資産小計,""
+
+12～19,その他流動資産に属する貸倒引当金以外を1科目ずつ配置
+20,貸倒引当金（▲）,貸倒引当金（▲）の合計
+21,その他流動資産(その他),12～16行および20行以外の「その他流動資産」に属する科目の合計。
+22,その他流動資産小計,12行目から19行目および21行目の合計から、20行目（貸倒引当金）を差し引いた純額を算出してください。
+23,流動資産合計,「流動資産合計」の値を data.json から直接転記。再計算不可。
+24,建物付属設備,- 以下の関連科目をすべて合算し、一つの「建物付属設備」として集計してください。
+  ・「建物」「建物付属設備」「建物附属設備」「建物備品」
+  ・「建築物」「建物（減価償却累計額を除く）」
+- 建物本体と付属設備が別々に計上されている場合は、その合計値を記載してください。
+- 「建物減価償却累計額」などのマイナス科目は、ここには含めず、純粋な取得価額（または帳簿価額）の合算を行ってください。
+- 絶対に合算してはいけない科目（構築物、機械装置、車両運搬具、什器・備品、土地）
+- 集計方法には「建物、建物附属設備を合算」のように、どの用語を統合したか簡潔に記述してください。
+25,構築物,構築物に関係する科目の金額を集計してください。
+26,機械装置,機械装置に関係する科目の金額を集計してください。
+27,車両運搬具,- 以下の関連科目をすべて合算し、一つの「車両運搬具」として集計してください。
+  ・「車両運搬具」「車輛運搬具（旧字体）」
+  ・「車両」「車輛」「運搬具」
+  ・「車両及び運搬具」「車輛及び運搬具」
+- 社用車、トラック、フォークリフトなどの具体的な車両名称が別掲されている場合も、すべてこの行に統合してください。
+- 「車両運搬具減価償却累計額」などのマイナス科目は含めず、取得価額（または帳簿価額）の合算を行ってください。
+- 集計方法には「車両、車輛運搬具を合算」のように、統合した用語を簡潔に記述してください。
+28,什器・備品,- 以下の関連科目をすべて合算し、一つの「什器・備品」として集計してください。
+  ・「工具器具備品」「工具・器具・備品」「器具備品」
+  ・「什器」「備品」「什器備品」
+  ・「事務機器」「事務備品」
+- 工具、金型、測定器などが別掲されている場合も、ここに含めてください。
+- ただし、「ソフトウェア」や「商標権」などの無形固定資産は含めないでください。
+- 「工具器具備品減価償却累計額」などのマイナス科目は含めず、取得価額（または帳簿価額）の合算を行ってください。
+- 集計方法には「工具器具備品、什器備品を合算」のように、統合した用語を簡潔に記述してください。
+29,土地
+30,建設仮勘定
+31,その他有形固定資産
+32,有形固定資産小計,""
+33,無形固定資産小計
+------------------------------------------------------------
+■34〜42 行：投資その他の資産
+------------------------------------------------------------
+34,投資有価証券,「投資有価証券」の金額のみ。
+35,出資金,「出資金」の金額のみ。
+36,（投資等スロット）,34,35,38〜41行に該当しない投資資産があれば1科目抽出。該当がない場合は、勘定科目を ""（空文字）とし、金額を 0 としてください。
+37,その他の投資等,34〜36および38〜41行の【いずれにも該当しない】個別の投資資産のみを合算。
+※注意：39行の「保険積立金」など、他の行に抽出した科目をここに含めてはいけません（二重計上禁止）。「投資その他の資産合計」等の合計行の数値も使用禁止です。
+38,関係会社株式,関係会社株式の金額。
+39,保険積立金,保険積立金、保険掛金、解約返戻金相当額等の保険に関わる金額。
+40,貸倒引当金（▲）,投資その他の資産に対応する貸倒引当金をプラスの数値（絶対値）で抽出。
+41,長期前払費用,長期前払費用、長期延滞税などの金額。
+42,投資等小計,自動計算（34+35+36+37+38+39+41 - 40）。
+43,繰延資産
+44,固定資産合計,「固定資産合計」の値を data.json から直接転記。再計算不可。
+45,資産合計,「資産合計」または「資産の部合計」の値を data.json から直接転記。絶対に内訳から再計算しないでください。
+46,支払手形
+47,買掛金
+48～52,流動負債その他スロット
+55,流動負債（その他）
+53,未払法人税等
+54,未払消費税
+56,流動負債合計,""
+
+57,固定負債スロット1,BSの「分類=固定負債」から、設備支払手形(59行)以外の固定負債内訳科目を1科目抽出して金額をそのまま入れる。固定負債の合計行（例:「固定負債」「固定負債合計」「固定負債の部合計」等）は二重計上防止のため絶対にスロットに入れない。該当が無い場合は勘定科目を""、金額を0。
+58,固定負債スロット2,同上（2科目目）。同じ科目を重複して入れない。該当が無い場合は勘定科目を""、金額を0。
+59,設備支払手形は、勘定科目名を必ず「設備支払手形」と出力する。金額が0の場合でも勘定科目名を省略してはいけない（例：59｜設備支払手形｜0｜0｜0｜｜設備支払手形なし）。
+60,固定負債スロット3,57,58と同様に固定負債内訳科目を抽出（3科目目）。該当が無い場合は勘定科目を""、金額を0。
+61,固定負債スロット4,同上（4科目目）。該当が無い場合は勘定科目を""、金額を0。
+62,固定負債スロット5,同上（5科目目）。該当が無い場合は勘定科目を""、金額を0。
+63,固定負債スロット6,同上（6科目目）。該当が無い場合は勘定科目を""、金額を0。
+64,固定負債合計,BSに存在する固定負債の合計行（例:「固定負債」「固定負債合計」「固定負債の部合計」等）の金額をそのまま取得して出力する。57〜63の合計から再計算してはならない（Python側で検算するため）。該当の合計行が無い場合のみ、57+58+59+60+61+62+63の合計で補完してよい。
+
+65,負債合計,""
+
+66,資本金
+67,資本剰余金
+68,利益剰余金
+69,うち準備金、積立金
+70,うち繰越利益剰余金
+71,資本等小計,""
+72,自己株式（▲）
+73,評価換算差額等
+74,純資産合計,""
+75,純資産・負債合計,""
+76,借方／貸方照合（資産合計－純資産・負債合計）
+77,受取手形割引高
+78,受取手形裏書譲渡高
+
+------------------------------------------------------------
+■79〜80 行：未使用行
+------------------------------------------------------------
+
+79, "",0,0,0,"","未使用行のため0とした"
+80, "",0,0,0,"","未使用行のため0とした"
+
+# ============================================================
+# ★修正：製造原価報告書（81〜111行）は BS/PL を一切参照しない
+#      → data.json の「製造原価」配列に記載の科目のみで確定させる
+# （禁止事項対応：このブロック以外は変更しない）
+# ============================================================
+
+seizo_list = source_data.get("製造原価", [])
+
+# 製造原価の「経費」候補を抽出する際の禁止語（仕様に準拠）
+_SEIZO_DENY_WORDS = [
+    "合計", "小計", "総計",
+    "当期経費", "経費合計", "当期総製造費用", "当期製品製造原価",
+    "製造原価",
+    "期首", "期末", "仕掛品", "棚卸", "増減"
+]
+
+def _name_has_any(name: str, words) -> bool:
+    for w in words:
+        if w in name:
+            return True
+    return False
+
+def _seizo_candidates(filter_kind: str = None):
+    # 製造原価配列の候補を返す。
+    # グローバル変数として seizo_list が存在することを前提としています
+    # もしエラーが出る場合は、関数の外で seizo_list = [] などと定義してください
+    out = []
+
+    # リストが空、または未定義の場合の対策
+    target_list = globals().get('seizo_list', []) if 'seizo_list' not in locals() else seizo_list
+
+    for it in (target_list or []):
+        nm_raw = str(it.get("勘定科目", "")).strip()
+        if nm_raw == "":
+            continue
+
+        bunrui = str(it.get("分類", "")).strip()
+
+        if filter_kind == "経費":
+            # 経費スロットや105計算の前提として、分類が明確に「経費/製造経費」のものだけを経費候補とする
+            if ("経費" in bunrui) or ("製造経費" in bunrui):
+                out.append(it)
+
+        elif filter_kind == "労務費":
+            if ("労務" in bunrui) or (bunrui == ""):
+                out.append(it)
+
+        elif filter_kind == "材料":
+            if ("材料" in bunrui) or (bunrui == ""):
+                out.append(it)
+
+        else:
+            # filter_kind が None または上記以外の場合は全件追加
+            out.append(it)
+
+    return out
+
+def _sum_seizo_by_patterns(items, include_patterns, exclude_patterns=None):
+    # _sum_bs_by_patterns と同形式（normalize + triplet）で製造原価配列に適用
+    if exclude_patterns is None:
+        exclude_patterns = []
+    total = [0, 0, 0]
+    matched = []
+
+    for item in (items or []):
+        name_norm = _normalize_account_name(item.get("勘定科目", ""))
+        if name_norm == "":
+            continue
+
+        excluded = False
+        for ep in exclude_patterns:
+            if re.search(ep, name_norm):
+                excluded = True
+                break
+        if excluded:
+            continue
+
+        included = False
+        for ip in include_patterns:
+            if re.search(ip, name_norm):
+                included = True
+                break
+        if not included:
+            continue
+
+        vals = _get_amount_triplet(item)
+        for j in range(3):
+            total[j] += vals[j]
+        matched.append(str(item.get("勘定科目", "")).strip())
+
+    return total, matched
+
+def _set_row_seizo(line_no: int, account_name: str, vals, method: str):
+    # 製造原価報告書（81〜111行）は「製造原価配列のみ」で確定させる。
+    # 行が未作成の場合でも必ず作成し、既存値（LLM/他表由来）を残さない。
+    if line_no not in row_dict:
+        row_dict[line_no] = {"行番号": line_no}
+
+    row_dict[line_no]["勘定科目"] = account_name
+    row_dict[line_no]["今期"], row_dict[line_no]["前期"], row_dict[line_no]["前々期"] = vals
+    row_dict[line_no]["集計方法"] = method
+
+
+# -----------------------------
+# 81〜84 材料費（製造原価配列のみ）
+# -----------------------------
+# 81 材料棚卸高（期首）
+v81, m81 = _sum_seizo_by_patterns(
+    _seizo_candidates("材料"),
+    include_patterns=[r"期首材料棚卸高", r"材料棚卸高", r"期首材料"],
+    exclude_patterns=[r"期末"]
+)
+_set_row_seizo(81, "材料棚卸高", v81, ("製造原価より: " + "、".join(m81)) if m81 else "製造原価より: 該当なし")
+
+# 82 当期材料仕入高
+v82, m82 = _sum_seizo_by_patterns(
+    _seizo_candidates("材料"),
+    include_patterns=[r"当期材料仕入高", r"材料仕入高", r"原材料仕入", r"材料購入", r"原材料購入", r"購入高", r"仕入"],
+    exclude_patterns=[r"期首", r"期末", r"棚卸", r"在庫", r"増減", r"合計", r"小計", r"総計"]
+)
+_set_row_seizo(82, "当期材料仕入高", v82, ("製造原価より: " + "、".join(m82)) if m82 else "製造原価より: 該当なし")
+
+# 83 期末材料棚卸高
+v83, m83 = _sum_seizo_by_patterns(
+    _seizo_candidates("材料"),
+    include_patterns=[r"期末材料棚卸高", r"期末材料", r"材料棚卸高"],
+    exclude_patterns=[r"期首"]
+)
+_set_row_seizo(83, "期末材料棚卸高", v83, ("製造原価より: " + "、".join(m83)) if m83 else "製造原価より: 該当なし")
+
+# 84 当期材料費（製造原価に「当期材料費/材料費」行があれば優先。無ければ 81+82-83）
+v84_direct, m84_direct = _sum_seizo_by_patterns(
+    _seizo_candidates("材料"),
+    include_patterns=[r"当期材料費", r"材料費"],
+    exclude_patterns=[r"合計", r"小計", r"総計"]
+)
+if (v84_direct[0] != 0 or v84_direct[1] != 0 or v84_direct[2] != 0) and m84_direct:
+    _set_row_seizo(84, "当期材料費（Ｖ）", v84_direct, "製造原価より: " + "、".join(m84_direct))
+else:
+    v84_calc = [v81[j] + v82[j] - v83[j] for j in range(3)]
+    _set_row_seizo(84, "当期材料費（Ｖ）", v84_calc, "製造原価のみで計算（81+82-83）")
+
+# -----------------------------
+# 85〜89 労務費（製造原価配列のみ）
+# -----------------------------
+# 85 賃金（賞与以外の給与性を集約）
+include_85 = [r"賃金", r"雑給", r"給料", r"給与", r"作業員給与", r"工員賃金", r"直接工賃金", r"臨時", r"パート", r"アルバイト", r"手当", r"役員報酬"]
+exclude_85 = [r"賞与", r"退職", r"法定福利", r"福利", r"厚生", r"当期労務費", r"労務費合計", r"合計", r"小計", r"総計"]
+v85, m85 = _sum_seizo_by_patterns(_seizo_candidates("労務費"), include_85, exclude_85)
+_set_row_seizo(85, "賃金", v85, ("製造原価より: " + "、".join(m85)) if m85 else "製造原価より: 該当なし")
+
+# 86 賞与
+v86, m86 = _sum_seizo_by_patterns(
+    _seizo_candidates("労務費"),
+    include_patterns=[r"賞与", r"賞与手当", r"賞与引当金", r"賞与給付"],
+    exclude_patterns=[r"雑給", r"給料", r"給与", r"役員報酬", r"合計", r"小計", r"総計"]
+)
+_set_row_seizo(86, "賞与", v86, ("製造原価より: " + "、".join(m86)) if m86 else "製造原価より: 該当なし")
+
+# 87 退職金
+v87, m87 = _sum_seizo_by_patterns(
+    _seizo_candidates("労務費"),
+    include_patterns=[r"退職", r"退職金", r"退職給付"],
+    exclude_patterns=[r"合計", r"小計", r"総計"]
+)
+_set_row_seizo(87, "退職金", v87, ("製造原価より: " + "、".join(m87)) if m87 else "製造原価より: 該当なし")
+
+# 88 厚生費（法定福利・福利厚生）
+v88, m88 = _sum_seizo_by_patterns(
+    _seizo_candidates("労務費"),
+    include_patterns=[r"法定福利", r"社会保険", r"健康保険", r"厚生年金", r"労働保険", r"雇用保険", r"福利厚生", r"厚生費"],
+    exclude_patterns=[r"賃金", r"給与", r"雑給", r"賞与", r"退職", r"合計", r"小計", r"総計"]
+)
+_set_row_seizo(88, "厚生費", v88, ("製造原価より: " + "、".join(m88)) if m88 else "製造原価より: 該当なし")
+
+# 89 当期労務費（85〜88の合計：製造原価のみで計算）
+v89_calc = [v85[j] + v86[j] + v87[j] + v88[j] for j in range(3)]
+_set_row_seizo(89, "当期労務費", v89_calc, "製造原価のみで計算（85+86+87+88）")
+
+# -----------------------------
+# 90〜105 製造経費（製造原価配列のみ）
+# -----------------------------
+# 90 減価償却費
+v90, m90 = _sum_seizo_by_patterns(
+    _seizo_candidates("経費"),
+    include_patterns=[r"減価償却", r"償却費"],
+    exclude_patterns=[r"合計", r"小計", r"総計"] + _SEIZO_DENY_WORDS
+)
+_set_row_seizo(90, "減価償却費", v90, ("製造原価より: " + "、".join(m90)) if m90 else "製造原価より: 該当なし")
+
+# 91 外注加工費
+v91, m91 = _sum_seizo_by_patterns(
+    _seizo_candidates("経費"),
+    include_patterns=[r"外注加工", r"加工外注", r"外注費.*加工", r"外注費\(?加工\)?"],
+    exclude_patterns=[r"合計", r"小計", r"総計"] + _SEIZO_DENY_WORDS
+)
+_set_row_seizo(91, "外注加工費", v91, ("製造原価より: " + "、".join(m91)) if m91 else "製造原価より: 該当なし")
+
+# 92 消耗品費
+v92, m92 = _sum_seizo_by_patterns(
+    _seizo_candidates("経費"),
+    include_patterns=[r"消耗品", r"副資材"],
+    exclude_patterns=[r"合計", r"小計", r"総計"] + _SEIZO_DENY_WORDS
+)
+_set_row_seizo(92, "消耗品費", v92, ("製造原価より: " + "、".join(m92)) if m92 else "製造原価より: 該当なし")
+
+# 93〜104：経費スロット（90〜92以外、禁止語を含む科目は除外）
+expense_items = []
+for it in _seizo_candidates("経費"):
+    nm = str(it.get("勘定科目", "")).strip()
+    if nm == "":
+        continue
+    # 禁止語（合計・期首期末など）を含むものはスロットに入れない
+    if _name_has_any(nm, _SEIZO_DENY_WORDS):
+        continue
+    # ★合計行・総括行は経費スロットに入れない（105で扱う）
+    if re.fullmatch(r"(経費|製造原価)", nm):
+        continue
+    # 90〜92に該当したものは除外（二重計上防止）
+    nm_norm = _normalize_account_name(nm)
+    already = False
+    for pat in (m90 + m91 + m92):
+        if _normalize_account_name(pat) == nm_norm and nm_norm != "":
+            already = True
+            break
+    if already:
+        continue
+    expense_items.append(it)
+
+# スロット 93〜103 に 1 科目ずつ配置
+slot_line_nos = list(range(93, 104))  # 93..103
+used_names_norm = set()
+
+def _assign_empty_slot(ln: int):
+    _set_row_seizo(ln, "", [0, 0, 0], "製造原価より: 該当なし")
+
+assigned = 0
+for ln in slot_line_nos:
+    # 次の未使用科目を探す
+    found = None
+    while expense_items:
+        cand = expense_items.pop(0)
+        cand_name = str(cand.get("勘定科目", "")).strip()
+        cand_norm = _normalize_account_name(cand_name)
+        if cand_norm == "" or cand_norm in used_names_norm:
+            continue
+        used_names_norm.add(cand_norm)
+        found = cand
+        break
+
+    if found is None:
+        _assign_empty_slot(ln)
+    else:
+        vals = _get_amount_triplet(found)
+        _set_row_seizo(ln, str(found.get("勘定科目", "")).strip(), vals, "製造原価より: 単独計上")
+        assigned += 1
+
+# 104：溢れ対応（残り経費を合算、無ければ0）
+remain_total = [0, 0, 0]
+remain_names = []
+for it in expense_items:
+    nm = str(it.get("勘定科目", "")).strip()
+    if nm == "":
+        continue
+    if _name_has_any(nm, _SEIZO_DENY_WORDS):
+        continue
+    # ★合計行・総括行は経費スロットに入れない（105で扱う）
+    if re.fullmatch(r"(経費|製造原価)", nm):
+        continue
+    nm_norm = _normalize_account_name(nm)
+    if nm_norm == "" or nm_norm in used_names_norm:
+        continue
+    vals = _get_amount_triplet(it)
+    for j in range(3):
+        remain_total[j] += vals[j]
+    remain_names.append(nm)
+
+if remain_names:
+    _set_row_seizo(104, "製造経費スロット溢れ対応", remain_total, "製造原価より溢れ分合算: " + "、".join(remain_names))
+else:
+    _set_row_seizo(104, "", [0, 0, 0], "製造原価より: 該当なし")
+
+# 105：当期経費（製造原価に「当期経費」があればそれを採用。無ければ 90〜104 を合算）
+v105_direct, m105_direct = _sum_seizo_by_patterns(
+    _seizo_candidates("経費"),
+    include_patterns=[r"当期経費"],
+    exclude_patterns=[]
+)
+if (v105_direct[0] != 0 or v105_direct[1] != 0 or v105_direct[2] != 0) and m105_direct:
+    _set_row_seizo(105, "当期製造経費", v105_direct, "製造原価より: " + "、".join(m105_direct))
+else:
+    # 90〜104 の行値（上で製造原価のみで確定済み）を合算
+    v105_calc = [0, 0, 0]
+    for ln in range(90, 105):
+        vv = get_vals(ln)
+        for j in range(3):
+            v105_calc[j] += vv[j]
+    _set_row_seizo(105, "当期製造経費", v105_calc, "製造原価のみで計算（90〜104合計）")
+
+# -----------------------------
+# 106〜111 仕掛品・製造原価（製造原価配列のみ）
+# -----------------------------
+# 106 期首仕掛品
+v106, m106 = _sum_seizo_by_patterns(
+    _seizo_candidates(),
+    include_patterns=[r"期首仕掛品", r"期首.*仕掛", r"期首WIP"],
+    exclude_patterns=[]
+)
+_set_row_seizo(106, "期首仕掛品", v106, ("製造原価より: " + "、".join(m106)) if m106 else "製造原価より: 該当なし")
+
+# 108 期末仕掛品
+v108, m108 = _sum_seizo_by_patterns(
+    _seizo_candidates(),
+    include_patterns=[r"期末仕掛品", r"期末.*仕掛", r"期末WIP"],
+    exclude_patterns=[]
+)
+_set_row_seizo(108, "期末仕掛品", v108, ("製造原価より: " + "、".join(m108)) if m108 else "製造原価より: 該当なし")
+
+# 109 他勘定振替高
+v109, m109 = _sum_seizo_by_patterns(
+    _seizo_candidates(),
+    include_patterns=[r"他勘定振替", r"振替高"],
+    exclude_patterns=[]
+)
+_set_row_seizo(109, "他勘定振替高", v109, ("製造原価より: " + "、".join(m109)) if m109 else "製造原価より: 該当なし")
+
+# 107 小計（製造原価のみで計算：84 + 89 + 105 + 106）
+v107_calc = [get_vals(84)[j] + get_vals(89)[j] + get_vals(105)[j] + get_vals(106)[j] for j in range(3)]
+_set_row_seizo(107, "小計", v107_calc, "製造原価のみで計算（84+89+105+106）")
+
+# 110 期首-期末仕掛品差額(V) = 106 - 108
+v110_calc = [get_vals(106)[j] - get_vals(108)[j] for j in range(3)]
+_set_row_seizo(110, "期首-期末仕掛品差額(V)", v110_calc, "製造原価のみで計算（106-108）")
+
+# 111 当期製造原価 = 107 - 108 - 109
+v111_calc = [get_vals(107)[j] - get_vals(108)[j] - get_vals(109)[j] for j in range(3)]
+_set_row_seizo(111, "当期製造原価", v111_calc, "製造原価のみで計算（107-108-109）")
+
+------------------------------------------------------------
+■勘定科目に関する注意
+------------------------------------------------------------
+
+- 全ての行において、金額が計上される場合は必ず適切な勘定科目名を付与してください。
+- 行15〜19などの未使用スロットで、金額が0の場合のみ、勘定科目を "" としても構いません。
+"""
+
+# -----------------------------
+# 元データ付きのユーザープロンプト（1〜111行用）
+# -----------------------------
+user_prompt = (
+    "以下が元データ(JSON)です。この BS および製造原価関連データを、直前の仕様にしたがって 1〜111 行に集計してください。\n"
+    "出力は必ず 111 行のテキストのみとし、各行を「行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法」の形式で出力してください。\n"
+    "ヘッダ行や説明文は絶対に出力しないでください。\n"
+    "=== 元データ(JSON) ===\n"
+    "<JSON_START>\n"
+    + json.dumps(source_data, ensure_ascii=False)
+    + "\n<JSON_END>"
+)
+
+# -----------------------------
+# Responses API 呼び出し（1〜111行）
+# -----------------------------
+response = client.responses.create(
+    model=MODEL,
+    input=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": spec_text},
+        {"role": "user", "content": user_prompt},
+    ],
+    temperature=0.0,
+    max_output_tokens=8192,
+)
+
+# -----------------------------
+# output からテキストを結合
+# -----------------------------
+raw_text = ""
+for block in response.output:
+    for item in block.content:
+        if isinstance(item, dict) and item.get("type") == "output_text":
+            raw_text += item.get("text", "")
+        elif hasattr(item, "type") and item.type == "output_text":
+            raw_text += item.text
+
+if not raw_text.strip():
+    print("---- デバッグ：response.output ----")
+    print(response.output)
+    raise RuntimeError("LLM 出力が取得できませんでした。")
+
+# -----------------------------
+# 行抽出：行頭が「数字｜」で始まる行だけを拾う（1〜3桁対応）
+# -----------------------------
+lines = []
+for line in raw_text.splitlines():
+    l = line.strip()
+    if re.match(r"^\d{1,3}｜", l):
+        lines.append(l)
+
+if len(lines) != 111:
+    print("---- デバッグ：raw_text ----")
+    print(raw_text)
+    raise ValueError(f"行頭が『数字｜』の行数が 111 行ではありません（{len(lines)} 行でした）。")
+
+# -----------------------------
+# 行をパースして Python オブジェクト化
+# -----------------------------
+rows = []
+for l in lines:
+    l = l.replace("|", "｜")
+    parts = [p.strip() for p in l.split("｜", 6)]
+    if len(parts) < 7:
+        parts += [""] * (7 - len(parts))
+
+
+    line_no_str, account_name, now_str, prev_str, prev2_str, kubun_str, method = parts
+
+    try:
+        line_no = int(line_no_str)
+    except ValueError:
+        raise ValueError(f"行番号が整数ではありません: {line_no_str}")
+
+    def to_int_safe_bs(s: str) -> int:
+        s = s.strip()
+        if s == "":
+            return 0
+        s = s.replace(",", "")
+        return int(s)
+
+    now_val = to_int_safe_bs(now_str)
+    prev_val = to_int_safe_bs(prev_str)
+    prev2_val = to_int_safe_bs(prev2_str)
+
+    row_obj = {
+        "行番号": line_no,
+        "勘定科目": account_name.strip(),
+        "今期": now_val,
+        "前期": prev_val,
+        "前々期": prev2_val,
+        "区分": kubun_str.strip(),
+        "集計方法": method.strip(),
+    }
+    rows.append(row_obj)
+
+# 行番号のチェック（1〜111 連番か）
+expected_numbers = list(range(1, 112))
+actual_numbers = sorted(r["行番号"] for r in rows)
+if actual_numbers != expected_numbers:
+    raise ValueError(f"行番号が 1〜111 の連番になっていません: {actual_numbers}")
+
+# ============================================================
+# ★修正点：建物付属設備(24) と 什器・備品(28) を Pythonで再集計して上書き
+# 目的：LLMが誤って「什器・備品」を「建物付属設備」に混入させても、最終結果を必ず正しくする
+# ============================================================
+
+def _normalize_account_name(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.strip()
+    # 全角・半角混在の記号を除去しつつ、判定用に単純化
+    s = s.replace("　", " ")
+    s = re.sub(r"\s+", "", s)
+    # よくある区切り記号を除去（判定を安定化）
+    s = s.replace("・", "")
+    s = s.replace("／", "")
+    s = s.replace("/", "")
+    s = s.replace("－", "-")
+    s = s.replace("―", "-")
+    s = s.replace("−", "-")
+    s = s.replace("（", "(")
+    s = s.replace("）", ")")
+    return s
+
+def _get_amount_triplet(item: dict):
+    """BS/PLアイテムから(今期, 前期, 前々期)をintで取得"""
+    def _to_int(v):
+        if v is None:
+            return 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip()
+        if s == "":
+            return 0
+        s = s.replace(",", "")
+        # 文字列が数値でない場合は0扱い（例外を避ける）
+        if not re.fullmatch(r"-?\d+", s):
+            return 0
+        return int(s)
+
+    now_v = 0
+    prev_v = 0
+    prev2_v = 0
+
+    # 形式: {"今期": {"金額": ...}, ...}
+    if isinstance(item, dict):
+        now_v = _to_int((item.get("今期") or {}).get("金額") if isinstance(item.get("今期"), dict) else item.get("今期"))
+        prev_v = _to_int((item.get("前期") or {}).get("金額") if isinstance(item.get("前期"), dict) else item.get("前期"))
+        prev2_v = _to_int((item.get("前々期") or {}).get("金額") if isinstance(item.get("前々期"), dict) else item.get("前々期"))
+
+    return [now_v, prev_v, prev2_v]
+
+def _sum_bs_by_patterns(bs_list, include_patterns, exclude_patterns=None):
+    """
+    bs_list: source_data["BS"] を想定
+    include_patterns: 正規表現リスト（正規化後の科目名に対して適用）
+    exclude_patterns: 除外する正規表現リスト（正規化後の科目名に対して適用）
+    """
+    if exclude_patterns is None:
+        exclude_patterns = []
+
+    total = [0, 0, 0]
+    matched_names = []
+
+    for item in (bs_list or []):
+        name = _normalize_account_name(item.get("勘定科目", ""))
+        if name == "":
+            continue
+
+        # 除外（減価償却累計額など）
+        excluded = False
+        for ep in exclude_patterns:
+            if re.search(ep, name):
+                excluded = True
+                break
+        if excluded:
+            continue
+
+        included = False
+        for ip in include_patterns:
+            if re.search(ip, name):
+                included = True
+                break
+        if not included:
+            continue
+
+        vals = _get_amount_triplet(item)
+        for j in range(3):
+            total[j] += vals[j]
+        matched_names.append(item.get("勘定科目", ""))
+
+    return total, matched_names
+
+# BS の一覧を取得
+bs_list = source_data.get("BS", [])
+
+# 「建物付属設備(24)」の包含・除外パターン
+# - 包含: 建物 / 建築物 / 建物付属設備 / 建物附属設備 / 建物備品 / 建物(減価償却累計額を除く) など
+# - 除外: 減価償却累計額 / 什器備品 / 工具器具備品 / 器具備品 / 機械装置 / 車両 / 構築物 / 土地 など
+include_24 = [
+    r"建物付属設備",
+    r"建物附属設備",
+    r"建物備品",
+    r"建物",
+    r"建築物",
+]
+exclude_common = [
+    r"減価償却累計額",
+    r"累計額",
+    r"償却累計",
+    r"控除",
+    r"\(控除\)",
+    r"△",
+    r"▲",
+]
+exclude_24 = exclude_common + [
+    r"什器備品",
+    r"什器",
+    r"備品",
+    r"工具器具備品",
+    r"工具器具",
+    r"器具備品",
+    r"機械装置",
+    r"車両運搬具",
+    r"車輛運搬具",
+    r"構築物",
+    r"土地",
+]
+
+# 「什器・備品(28)」の包含・除外パターン
+include_28 = [
+    r"工具器具備品",
+    r"工具器具",
+    r"器具備品",
+    r"什器備品",
+    r"什器",
+    r"備品",
+    r"事務機器",
+    r"事務備品",
+]
+exclude_28 = exclude_common + [
+    r"ソフトウェア",
+    r"商標権",
+    r"のれん",
+    r"特許",
+    r"無形",
+]
+
+sum24, matched24 = _sum_bs_by_patterns(bs_list, include_24, exclude_24)
+sum28, matched28 = _sum_bs_by_patterns(bs_list, include_28, exclude_28)
+
+# LLM出力の rows を辞書化して上書き
+row_map_1_111 = {r["行番号"]: r for r in rows}
+
+if 24 in row_map_1_111:
+    row_map_1_111[24]["今期"], row_map_1_111[24]["前期"], row_map_1_111[24]["前々期"] = sum24
+    row_map_1_111[24]["勘定科目"] = "建物付属設備"
+    # 集計方法：どの科目が対象になったか（空なら「該当なし」）
+    if matched24:
+        row_map_1_111[24]["集計方法"] = "再集計: " + "、".join([str(x) for x in matched24])
+    else:
+        row_map_1_111[24]["集計方法"] = "再集計: 該当なし(0)"
+
+if 28 in row_map_1_111:
+    row_map_1_111[28]["今期"], row_map_1_111[28]["前期"], row_map_1_111[28]["前々期"] = sum28
+    row_map_1_111[28]["勘定科目"] = "什器・備品"
+    if matched28:
+        row_map_1_111[28]["集計方法"] = "再集計: " + "、".join([str(x) for x in matched28])
+    else:
+        row_map_1_111[28]["集計方法"] = "再集計: 該当なし(0)"
+
+# rows を再構築（順序保持）
+rows = [row_map_1_111[i] for i in range(1, 112)]
+
+# ============================================================
+# 2-A. PL（112〜120行：売上〜売上総利益）の集計【新規追加】
+# ============================================================
+
+system_prompt_pl_112_120 = """
+あなたは日本の中小企業の決算書（単体）の専門家です。
+
+出力フォーマットに関して、次のルールを絶対に守ってください：
+1. 出力は 9 行のテキストのみとし（112〜120行）、それ以外の行や説明文、空行、コメントは一切出力してはいけません。
+2. 各行は次の形式とします（カンマではなく全角の縦棒「｜」で区切る）：
+   行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法
+3. 行番号は 112 〜 120 の整数とし、112 行目は 112、…、120 行目は 120 です。
+4. 「今期」「前期」「前々期」は整数のみとし、カンマ区切りや単位（円、千円など）は付けません。金額が無い場合は 0 とします。
+5. 「区分」は、変動費なら "V"、固定費なら "F"、該当しない行は空文字 "" とします。
+6. 区切り文字として使用する全角縦棒「｜」は、フィールドの中（特に「集計方法」）では絶対に使わないでください。
+7. ヘッダ行（「行番号｜勘定科目｜…」など）は出力してはいけません。1 行目からいきなり「112｜売上高｜…」の形式で始めてください。
+8. 9 行ちょうど出力してください。10 行以上や 8 行以下になってはいけません。
+
+以上のフォーマットに違反すると、後段の処理が失敗します。
+"""
+
+spec_text_pl_112_120 = """
+■目的
+与えられた data.json の PL 部分および製造原価情報を用いて、
+112〜120 行（売上高〜売上総利益）を集計します。
+
+■前提
+- data.json の "PL" 配列には、「売上高」「売上値引」「売上割戻」「売上戻り」「完成工事高」「完成工事原価」「売上原価」「期首商品棚卸高」「期末商品棚卸高」「工事原価」などの科目が含まれていると想定します。
+- 金額が空文字の場合は 0 とみなします。
+- 「表記ゆれ」はあなたの判断で同一科目として扱ってください（例：売上高／完成工事高、売上原価／完成工事原価 など）。
+
+■行定義（112〜120行）
+
+112,売上高,売上高の合計（売上高の合計は、単純に一番大きな値ではなく、売上値引きなどマイナスされる売上項目がある事を考慮して下さい。）
+113,期首製品・商品棚高,期首製品・商品棚高の合計（期首工事棚卸高も含む）
+114,商品仕入高,商品仕入高の合計（工事原価を含む）
+115,当期製造原価,当期製造原価の合計（当期工事原価を含む）
+116,他勘定振替高,他勘定振替高の合計
+117,期末製品・商品棚卸高,期末製品・商品棚卸高の合計（未成工事支出金を含む）
+118,期首-期末製品差額(V),期首-期末製品差額(V)の合計
+119,売上原価合計,売上原価合計の合計（完成工事原価を含む）
+120,売上総利益,売上総利益の合計
+
+■各行の具体的な集計ルール
+
+●112 行：売上高
+- 最優先：PL 配列に「売上高」という勘定科目が存在する場合は、その金額をそのまま 112 行に採用してください（他科目を足し引きして組み替えない）。
+- 「売上高」が存在しない場合のみ、以下のルールで集計して正味売上高を算出してください。
+
+【加算（プラス）する科目】
+- 「売上高」「事業収入」「売電収入」「完成工事高」など売上・収入系の科目
+- 「ネット売上高」は売上控除ではないため、必ずプラス（加算）として扱う（マイナスにしない）
+
+【控除（マイナス）してよい科目（売上値引き系のみ）】
+- 科目名に次の語を含むものだけを売上控除として扱い、マイナス（控除）する：
+  「売上値引」「値引」「売上戻り」「戻り」「売上割戻」「割戻」「返品」「リベート」「相殺」「キャンセル」
+- ただし「ネット売上高」は上記に該当しても控除扱いにしない（常に加算）。
+
+- 集計方法には、採用した勘定科目（加算/控除）を簡潔に列挙してください。
+- 区分は "" とします。
+
+
+●113 行：期首製品・商品棚高
+- 「期首商品棚卸高」「期首製品棚卸高」「期首製品及び商品棚卸高」「期首工事棚卸高」など、
+  売上原価計算における期首在庫（商品・製品・工事等）を合算してください。
+- 区分は "" とします。
+
+●114 行：商品仕入高
+- 114 行は、「期首棚卸高を含まない、当期中に発生した純粋な仕入金額（購入額）」を表す行とする。
+- 原則として、PL 配列のうち「分類＝売上原価」に属し、かつ次の条件をすべて満たす科目を対象に集計する。
+
+【114 に含める条件】
+- 当期中の「仕入」「購入」「材料購入」「商品購入」等を表す科目であること。
+- 期首棚卸高・期末棚卸高・棚卸資産増減・仕掛品増減などの在庫調整科目を含まないこと。
+- 当期製造原価・売上原価合計・仕入合計・ネット仕入高などの合計・調整概念ではないこと。
+
+【典型的に 114 に含まれる科目例（名称は例示）】
+- 商品仕入高
+- 材料仕入高
+- 商品材料仕入高
+- 原材料仕入高
+- 購入高
+※上記は例示であり、名称一致ではなく「当期の仕入（購入）金額」という意味内容で判断する。
+
+【114 に含めてはいけない科目】
+- 期首商品棚卸高、期首製品棚卸高
+- 期末商品棚卸高、期末製品棚卸高
+- 棚卸資産増減、在庫増減
+- 当期製造原価、売上原価、売上原価合計
+- 仕入合計、ネット仕入高、差引仕入高等の合計・調整科目
+
+- 集計方法には、「当期仕入金額（期首棚卸を含まない）」等、判断根拠を簡潔に記載する。
+- 区分は "" とする。
+
+
+●115 行：当期製造原価
+- 製造業の場合は「当期製造原価」「製品製造原価」「当期工事原価」などに該当する科目を合算してください。
+- 可能であれば、BS・製造原価パートで計算した行111「当期製造原価」と整合するように金額を合わせてください（JSON に該当科目がある範囲で構いません）。
+- 区分は "" とします。
+
+●116 行：他勘定振替高
+- 「他勘定振替高」「製造原価振替高」「完成工事原価振替高」などを合算してください。
+- 区分は "" とします。
+
+●117 行：期末製品・商品棚卸高
+- 「期末商品棚卸高」「期末製品棚卸高」「期末商品及び製品棚卸高」「未成工事支出金」など、
+  売上原価計算における期末在庫（商品・製品・工事等）を合算してください。
+- 区分は "" とします。
+
+●118 行：期首-期末製品差額(V)
+- 原則として、113 行の期首製品・商品棚高から 117 行の期末製品・商品棚卸高を差し引いた金額（113 - 117）を計上してください。
+- もし PL 上に「製品棚卸差額」「工事棚卸差額」など同趣旨の科目が存在する場合は、それらを優先的に用いても構いません。
+- 区分は "V"（変動費）とします。
+
+●119 行：売上原価合計
+- 売上原価全体として「売上原価」「完成工事原価」など PL 上の売上原価科目を合算してください。
+- 売上原価の内訳として 113〜118 行で示した構造（期首在庫＋仕入高＋当期製造原価＋他勘定振替高−期末在庫）の考え方と大きく矛盾しないようにしてください。
+- PL 上に明確な「売上原価」が存在する場合は、そちらの合計金額を優先し、113〜118 行との関係は「集計方法」で説明してください。
+- 区分は "" とします。
+
+●120 行：売上総利益
+- 売上総利益は、原則として 112 行「売上高」から 119 行「売上原価合計」を差し引いた金額（売上高−売上原価）としてください。
+- PL 上に「売上総利益」「粗利益」「完成工事総利益」などがある場合は、そちらの金額に合わせることを優先して構いません。
+- 区分は "" とします。
+
+■注意
+- 112〜120 行の「区分」は 118 行のみ "V" で、それ以外の行は "" としてください。
+- 9 行すべてを必ず出力し、行番号は 112〜120 の連番にしてください。
+"""
+
+user_prompt_pl_112_120 = (
+    "以下が元データ(JSON)です。この PL データおよび製造原価データを、直前の仕様にしたがって 112〜120 行に集計してください。\n"
+    "出力は必ず 9 行のテキストのみとし、各行を「行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法」の形式で出力してください。\n"
+    "ヘッダ行や説明文は絶対に出力しないでください。\n"
+    "=== 元データ(JSON) ===\n"
+    "<JSON_START>\n"
+    + json.dumps(source_data, ensure_ascii=False)
+    + "\n<JSON_END>"
+)
+
+response_pl_112_120 = client.responses.create(
+    model=MODEL,
+    input=[
+        {"role": "system", "content": system_prompt_pl_112_120},
+        {"role": "user", "content": spec_text_pl_112_120},
+        {"role": "user", "content": user_prompt_pl_112_120},
+    ],
+    temperature=0.0,
+    max_output_tokens=4096,
+)
+
+raw_text_pl_112_120 = ""
+for block in response_pl_112_120.output:
+    for item in block.content:
+        if isinstance(item, dict) and item.get("type") == "output_text":
+            raw_text_pl_112_120 += item.get("text", "")
+        elif hasattr(item, "type") and item.type == "output_text":
+            raw_text_pl_112_120 += item.text
+
+if not raw_text_pl_112_120.strip():
+    print("---- デバッグ：response_pl_112_120.output ----")
+    print(response_pl_112_120.output)
+    raise RuntimeError("PL 112〜120 用 LLM 出力が取得できませんでした。")
+
+lines_pl_112_120 = []
+for line in raw_text_pl_112_120.splitlines():
+    l = line.strip()
+    if re.match(r"^\d{3}｜", l):
+        lines_pl_112_120.append(l)
+
+if len(lines_pl_112_120) != 9:
+    print("---- デバッグ：raw_text_pl_112_120 ----")
+    print(raw_text_pl_112_120)
+    raise ValueError(f"PL 112〜120 部分の行数が 9 行ではありません（{len(lines_pl_112_120)} 行でした）。")
+
+rows_pl_112_120 = []
+for l in lines_pl_112_120:
+    parts = l.split("｜", 6)
+    if len(parts) != 7:
+        raise ValueError(f"PL 112〜120: 7 フィールドに分割できませんでした: {l}")
+
+    line_no_str, account_name, now_str, prev_str, prev2_str, kubun_str, method = parts
+
+    try:
+        line_no = int(line_no_str)
+    except ValueError:
+        raise ValueError(f"PL 112〜120: 行番号が整数ではありません: {line_no_str}")
+
+    def to_int_safe_pl112(s: str) -> int:
+        s = s.strip()
+        if s == "":
+            return 0
+        s = s.replace(",", "")
+        return int(s)
+
+    now_val = to_int_safe_pl112(now_str)
+    prev_val = to_int_safe_pl112(prev_str)
+    prev2_val = to_int_safe_pl112(prev2_str)
+
+    row_obj = {
+        "行番号": line_no,
+        "勘定科目": account_name.strip(),
+        "今期": now_val,
+        "前期": prev_val,
+        "前々期": prev2_val,
+        "区分": kubun_str.strip(),
+        "集計方法": method.strip(),
+    }
+    rows_pl_112_120.append(row_obj)
+
+expected_numbers_pl_112_120 = list(range(112, 121))
+actual_numbers_pl_112_120 = sorted(r["行番号"] for r in rows_pl_112_120)
+if actual_numbers_pl_112_120 != expected_numbers_pl_112_120:
+    raise ValueError(f"PL 112〜120 部分の行番号が 112〜120 の連番になっていません: {actual_numbers_pl_112_120}")
+
+# ============================================================
+# 2-B. PL（121〜154行：販管費〜当期利益）の集計（前回どおり）
+# ============================================================
+
+system_prompt_pl = """
+あなたは日本の中小企業の決算書（単体）の専門家です。
+
+出力フォーマットに関して、次のルールを絶対に守ってください：
+1. 出力は 34 行のテキストのみとし（121〜154行）、それ以外の行や説明文、空行、コメントは一切出力してはいけません。
+2. 各行は次の形式とします（カンマではなく全角の縦棒「｜」で区切る）：
+   行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法
+3. 行番号は 121 〜 154 の整数とし、121 行目は 121、122 行目は 122、…、154 行目は 154 です。
+4. 「今期」「前期」「前々期」は整数のみとし、カンマ区切りや単位（円、千円など）は付けません。金額が無い場合は 0 とします。
+5. 「区分」は、変動費なら "V"、固定費なら "F"、該当しない行は空文字 "" とします。
+6. 区切り文字として使用する全角縦棒「｜」は、フィールドの中（特に「集計方法」）では絶対に使わないでください。
+7. ヘッダ行（「行番号｜勘定科目｜…」など）は出力してはいけません。1 行目からいきなり「121｜役員報酬｜…」の形式で始めてください。
+8. 34 行ちょうど出力してください。35 行以上や 33 行以下になってはいけません。
+
+以上のフォーマットに違反すると、後段の処理が失敗します。
+"""
+
+spec_text_pl = """
+■目的
+与えられた data.json の PL 部分および「販売費」セクションを用いて、
+121〜154 行のフォーマットに集計します。
+
+■前提
+- data.json は概ね次のような構造を持つとします:
+  {
+    "BS": [...],
+    "PL": [...],
+    "販売費": [...]
+  }
+- 金額が空文字の場合は 0 とみなします。
+- 「表記ゆれ」は、あなたの判断で同一科目として扱ってください。
+
+------------------------------------------------------------
+■121〜139 行：販売費及び一般管理費の内訳
+------------------------------------------------------------
+
+121,役員報酬,役員報酬の合計,F
+122,給与・賞与,給与・賞与の合計,F
+123,退職金,退職金の合計,F
+124,法定福利費・福利厚生費,法定福利費・福利厚生費の合計,F
+125,減価償却費,減価償却費の合計,F
+126,貸倒償却費,貸倒償却費の合計,F
+127,取扱手数料,取扱手数料の合計,F
+128,旅費交通費,旅費交通費の合計,F
+129,支払手数料,支払手数料の合計,F
+130,荷造運賃,荷造運賃の合計,F
+131,地代家賃,地代家賃の合計,F
+132,保険料,保険料の合計,F
+133,租税公課,租税公課の合計,F
+134,広告宣伝費,広告宣伝費の合計,F
+135,水道光熱費,水道光熱費の合計,F
+136,事務用・備品消耗品費,事務用・備品消耗品費の合計,F
+137,通信費,通信費の合計,F
+138,その他雑費,その他雑費の合計,F
+139,合計,販管費の合計,F
+
+- "販売費" 配列の科目を、上記行にマッピングします。
+- 行121〜137の定義に該当する科目は、それぞれの行に集約して合算してください。
+- 行121〜137のいずれにも該当しない販売費科目は、すべて行138「その他雑費」に集計します。
+- 行139は、行121〜138の合計とし、可能な限り PL の「販売費及び一般管理費」合計と一致させてください。
+
+------------------------------------------------------------
+■140〜154 行：営業利益以降の PL
+------------------------------------------------------------
+
+140,営業利益,営業利益
+141,受取利息・配当,受取利息・配当の合計
+142,雑収入,雑収入の合計
+143は営業外収入で141,142以外の科目が入る。空の場合は""とする
+144は営業外収入で141,142,143以外の科目が入る。複数残っている場合は、営業外収入（その他）として金額を集計する。空の場合は""とする
+145,営業外収入合計,営業外収入の合計
+146,支払利息割引料,支払利息割引料の合計
+147,営業外支出その他,営業外支出その他の合計
+148,営業外支出合計,営業外支出の合計
+149,経常利益,経常利益の合計
+150,特別利益,特別利益の合計
+151,特別損失,特別損失の合計
+152,税引前当期利益,税引前当期利益の合計
+153,法人税等充当額,法人税等充当額の合計
+154,当期利益,当期利益の合計
+
+- 行140〜154の「区分」はすべて "" としてください。
+- 営業外収入／営業外支出の科目分類は、PL の「営業外収益」「営業外費用」区分を参考にしてください。
+"""
+
+user_prompt_pl = (
+    "以下が元データ(JSON)です。この PL および販売費データを、直前の仕様にしたがって 121〜154 行に集計してください。\n"
+    "出力は必ず 34 行のテキストのみとし、各行を「行番号｜勘定科目｜今期｜前期｜前々期｜区分｜集計方法」の形式で出力してください。\n"
+    "ヘッダ行や説明文は絶対に出力しないでください。\n"
+    "=== 元データ(JSON) ===\n"
+    "<JSON_START>\n"
+    + json.dumps(source_data, ensure_ascii=False)
+    + "\n<JSON_END>"
+)
+
+response_pl = client.responses.create(
+    model=MODEL,
+    input=[
+        {"role": "system", "content": system_prompt_pl},
+        {"role": "user", "content": spec_text_pl},
+        {"role": "user", "content": user_prompt_pl},
+    ],
+    temperature=0.0,
+    max_output_tokens=4096,
+)
+
+raw_text_pl = ""
+for block in response_pl.output:
+    for item in block.content:
+        if isinstance(item, dict) and item.get("type") == "output_text":
+            raw_text_pl += item.get("text", "")
+        elif hasattr(item, "type") and item.type == "output_text":
+            raw_text_pl += item.text
+
+if not raw_text_pl.strip():
+    print("---- デバッグ：response_pl.output ----")
+    print(response_pl.output)
+    raise RuntimeError("PL 用 LLM 出力が取得できませんでした。")
+
+lines_pl = []
+for line in raw_text_pl.splitlines():
+    l = line.strip()
+    if re.match(r"^\d{3}｜", l):
+        lines_pl.append(l)
+
+if len(lines_pl) != 34:
+    print("---- デバッグ：raw_text_pl ----")
+    print(raw_text_pl)
+    raise ValueError(f"PL 部分の行頭が『数字｜』の行数が 34 行ではありません（{len(lines_pl)} 行でした）。")
+
+rows_pl = []
+for l in lines_pl:
+    parts = l.split("｜", 6)
+    if len(parts) != 7:
+        raise ValueError(f"PL: 7 フィールドに分割できませんでした: {l}")
+
+    line_no_str, account_name, now_str, prev_str, prev2_str, kubun_str, method = parts
+
+    try:
+        line_no = int(line_no_str)
+    except ValueError:
+        raise ValueError(f"PL: 行番号が整数ではありません: {line_no_str}")
+
+    def to_int_safe_pl(s: str) -> int:
+        s = s.strip()
+        if s == "":
+            return 0
+        s = s.replace(",", "")
+        return int(s)
+
+    now_val = to_int_safe_pl(now_str)
+    prev_val = to_int_safe_pl(prev_str)
+    prev2_val = to_int_safe_pl(prev2_str)
+
+    row_obj = {
+        "行番号": line_no,
+        "勘定科目": account_name.strip(),
+        "今期": now_val,
+        "前期": prev_val,
+        "前々期": prev2_val,
+        "区分": kubun_str.strip(),
+        "集計方法": method.strip(),
+    }
+    rows_pl.append(row_obj)
+
+expected_numbers_pl = list(range(121, 155))
+actual_numbers_pl = sorted(r["行番号"] for r in rows_pl)
+if actual_numbers_pl != expected_numbers_pl:
+    raise ValueError(f"PL 部分の行番号が 121〜154 の連番になっていません: {actual_numbers_pl}")
+
+# ============================================================
+# 3. 全 1〜154 行をまとめ、Pythonで合計行を再計算
+# ============================================================
+
+# 1〜154行を統合
+all_rows_list = rows + rows_pl_112_120 + rows_pl
+
+# 計算しやすいように行番号をキーとした辞書に変換
+row_dict = {r["行番号"]: r for r in all_rows_list}
+
+# ============================================================
+# ★修正：製造原価報告書（81〜111行）は、data.json の「製造原価」配列以外から金額を取得しない
+#        （BS/PL/LLM出力由来の値が入っていても、ここで必ず上書きする）
+#        ※修正対象外のロジックは変更しない
+# ============================================================
+
+def _apply_seizo_only_81_111(row_dict, source_data):
+    seizo_list = source_data.get("製造原価", [])
+
+    _SEIZO_DENY_WORDS = [
+        "合計", "小計", "総計", "当期経費", "経費合計", "当期総製造費用", "当期製品製造原価",
+        "期首", "期末", "仕掛品", "棚卸", "増減"
+    ]
+
+    def _set_row(line_no, account_name, vals, method):
+        if line_no not in row_dict:
+            row_dict[line_no] = {"行番号": line_no}
+        row_dict[line_no]["行番号"] = line_no
+        row_dict[line_no]["勘定科目"] = account_name
+        row_dict[line_no]["今期"], row_dict[line_no]["前期"], row_dict[line_no]["前々期"] = vals
+        # 製造原価報告書は区分が必要な行のみ設定（不明なら空）
+        if "区分" not in row_dict[line_no]:
+            row_dict[line_no]["区分"] = ""
+        row_dict[line_no]["集計方法"] = method if (method and str(method).strip()) else "該当なし"
+
+    def _norm(s):
+        return _normalize_account_name(s)
+
+    def _triplet(item):
+        return _get_amount_triplet(item)
+
+    def _sum_by_patterns(items, include_patterns, exclude_patterns=None):
+        if exclude_patterns is None:
+            exclude_patterns = []
+        total = [0, 0, 0]
+        matched = []
+        for it in (items or []):
+            nm = _norm(it.get("勘定科目", ""))
+            if nm == "":
+                continue
+            excluded = False
+            for ep in exclude_patterns:
+                if re.search(ep, nm):
+                    excluded = True
+                    break
+            if excluded:
+                continue
+            included = False
+            for ip in include_patterns:
+                if re.search(ip, nm):
+                    included = True
+                    break
+            if not included:
+                continue
+            vals = _triplet(it)
+            for j in range(3):
+                total[j] += vals[j]
+            matched.append(str(it.get("勘定科目", "")).strip())
+        return total, matched
+
+    def _has_any(raw_name, words):
+        s = str(raw_name or "")
+        for w in words:
+            if w in s:
+                return True
+        return False
+
+    # -----------------------------
+    # 81〜84 材料費（製造原価配列のみ）
+    # -----------------------------
+    v81, m81 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"期首材料棚卸高", r"期首.*材料.*棚卸", r"材料棚卸高", r"期首材料"],
+        exclude_patterns=[r"期末"]
+    )
+    _set_row(81, "材料棚卸高", v81, ("製造原価より: " + "、".join(m81)) if m81 else "製造原価より: 該当なし")
+
+    v82, m82 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"当期材料仕入高", r"材料仕入高", r"原材料仕入", r"材料購入", r"原材料購入", r"購入高", r"仕入"],
+        exclude_patterns=[r"期首", r"期末", r"棚卸", r"在庫", r"合計", r"小計", r"総計"]
+    )
+    _set_row(82, "当期材料仕入高", v82, ("製造原価より: " + "、".join(m82)) if m82 else "製造原価より: 該当なし")
+
+    v83, m83 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"期末材料棚卸高", r"期末.*材料.*棚卸", r"期末材料", r"材料棚卸高"],
+        exclude_patterns=[r"期首"]
+    )
+    _set_row(83, "期末材料棚卸高", v83, ("製造原価より: " + "、".join(m83)) if m83 else "製造原価より: 該当なし")
+
+    v84_direct, m84_direct = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"当期材料費", r"材料費"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    if m84_direct and (v84_direct[0] != 0 or v84_direct[1] != 0 or v84_direct[2] != 0):
+        _set_row(84, "当期材料費（Ｖ）", v84_direct, "製造原価より: " + "、".join(m84_direct))
+    else:
+        v84_calc = [v81[j] + v82[j] - v83[j] for j in range(3)]
+        _set_row(84, "当期材料費（Ｖ）", v84_calc, "製造原価のみで計算（81+82-83）")
+    row_dict[84]["区分"] = "V"
+
+    # -----------------------------
+    # 85〜89 労務費（製造原価配列のみ）
+    # -----------------------------
+    include_85 = [r"賃金", r"雑給", r"給料", r"給与", r"作業員給与", r"工員賃金", r"直接工賃金", r"臨時", r"パート", r"アルバイト", r"手当", r"役員報酬"]
+    exclude_85 = [r"賞与", r"退職", r"法定福利", r"福利", r"厚生", r"当期労務費", r"労務費合計", r"合計", r"小計", r"総計"]
+    v85, m85 = _sum_by_patterns(seizo_list, include_85, exclude_85)
+    _set_row(85, "賃金", v85, ("製造原価より: " + "、".join(m85)) if m85 else "製造原価より: 該当なし")
+
+    v86, m86 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"賞与", r"賞与手当", r"賞与引当金", r"賞与給付"],
+        exclude_patterns=[r"雑給", r"給料", r"給与", r"役員報酬", r"合計", r"小計", r"総計"]
+    )
+    _set_row(86, "賞与", v86, ("製造原価より: " + "、".join(m86)) if m86 else "製造原価より: 該当なし")
+
+    v87, m87 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"退職", r"退職金", r"退職給付"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    _set_row(87, "退職金", v87, ("製造原価より: " + "、".join(m87)) if m87 else "製造原価より: 該当なし")
+
+    v88, m88 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"法定福利", r"社会保険", r"健康保険", r"厚生年金", r"労働保険", r"雇用保険", r"福利厚生", r"厚生費"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    _set_row(88, "厚生費", v88, ("製造原価より: " + "、".join(m88)) if m88 else "製造原価より: 該当なし")
+
+    v89_calc = [v85[j] + v86[j] + v87[j] + v88[j] for j in range(3)]
+    _set_row(89, "当期労務費", v89_calc, "製造原価のみで計算（85+86+87+88）")
+
+    # 区分（労務費は原則V）
+    for ln in [85, 86, 87, 88, 89]:
+        row_dict[ln]["区分"] = "V"
+
+    # -----------------------------
+    # 90〜104 製造経費（製造原価配列のみ）
+    # -----------------------------
+    v90, m90 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"減価償却", r"償却費"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    _set_row(90, "減価償却費", v90, ("製造原価より: " + "、".join(m90)) if m90 else "製造原価より: 該当なし")
+
+    v91, m91 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"外注加工", r"加工外注", r"外注費.*加工", r"外注費\(?加工\)?"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    _set_row(91, "外注加工費", v91, ("製造原価より: " + "、".join(m91)) if m91 else "製造原価より: 該当なし")
+
+    v92, m92 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"消耗品", r"副資材"],
+        exclude_patterns=[r"合計", r"小計", r"総計"]
+    )
+    _set_row(92, "消耗品費", v92, ("製造原価より: " + "、".join(m92)) if m92 else "製造原価より: 該当なし")
+
+    used_norm = set(_norm(x) for x in (m90 + m91 + m92))
+
+    # 93〜104 に割り当てる候補：合計/小計/期首期末/仕掛品などは除外
+    expense_candidates = []
+    for it in (seizo_list or []):
+        raw_nm = str(it.get("勘定科目", "")).strip()
+        nm = _norm(raw_nm)
+        if nm == "":
+            continue
+        if nm in used_norm:
+            continue
+        bunrui = str(it.get("分類", "")).strip()
+        # 90〜105 は「製造経費（経費内訳）」のみを対象とするため、分類が経費以外（例: 労務費/材料）は除外
+        # ★分類が空のものは「経費」と断定できないため除外（混入防止）
+        if ("経費" not in bunrui) and ("製造経費" not in bunrui):
+            continue
+        if _has_any(raw_nm, _SEIZO_DENY_WORDS):
+            continue
+        # ★合計行の「経費」単独名は 93〜104 に入れない（105で扱う）
+        if re.fullmatch(r"(経費|製造原価)", raw_nm):
+            continue
+        # 90-92で拾う典型語はここでは除外（二重計上抑止）
+        if re.search(r"減価償却|償却費|外注加工|加工外注|消耗品|副資材", nm):
+            continue
+        expense_candidates.append(it)
+
+    # 93〜103 に単独配置、足りなければ空
+    slot_line_nos = list(range(93, 104))  # 93..103
+    used_slot_names = []
+    for ln in slot_line_nos:
+        if expense_candidates:
+            it = expense_candidates.pop(0)
+            raw_nm = str(it.get("勘定科目", "")).strip()
+            vals = _triplet(it)
+            _set_row(ln, raw_nm, vals, "製造原価より: 単独計上")
+            used_slot_names.append(raw_nm)
+        else:
+            _set_row(ln, "", [0, 0, 0], "製造原価より: 該当なし")
+
+    # 104 は溢れ合算
+    remain_total = [0, 0, 0]
+    remain_names = []
+    for it in expense_candidates:
+        raw_nm = str(it.get("勘定科目", "")).strip()
+        if raw_nm == "":
+            continue
+        if _has_any(raw_nm, _SEIZO_DENY_WORDS):
+            continue
+        nm = _norm(raw_nm)
+        if nm == "":
+            continue
+        vals = _triplet(it)
+        for j in range(3):
+            remain_total[j] += vals[j]
+        remain_names.append(raw_nm)
+
+    if remain_names:
+        _set_row(104, "製造経費スロット溢れ対応", remain_total, "製造原価より溢れ分合算: " + "、".join(remain_names))
+    else:
+        _set_row(104, "", [0, 0, 0], "製造原価より: 該当なし")
+
+    # 区分（製造経費は原則V）
+    for ln in range(90, 105):
+        if ln not in row_dict:
+            continue
+        row_dict[ln]["区分"] = "V"
+
+    # 105 当期製造経費：直接があれば採用、無ければ 90〜104 合算
+    v105_direct, m105_direct = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"当期経費", r"^経費$", r"^製造原価$"],
+        exclude_patterns=[]
+    )
+    if m105_direct and (v105_direct[0] != 0 or v105_direct[1] != 0 or v105_direct[2] != 0):
+        _set_row(105, "当期製造経費", v105_direct, "製造原価より: " + "、".join(m105_direct))
+    else:
+        v105_calc = [0, 0, 0]
+        for ln in range(90, 105):
+            vv = row_dict.get(ln, {})
+            v = [vv.get("今期", 0), vv.get("前期", 0), vv.get("前々期", 0)]
+            # row_dict の値は int 想定
+            v105_calc[0] += int(v[0] or 0)
+            v105_calc[1] += int(v[1] or 0)
+            v105_calc[2] += int(v[2] or 0)
+        _set_row(105, "当期製造経費", v105_calc, "製造原価のみで計算（90〜104合計）")
+    row_dict[105]["区分"] = "V"
+
+    # -----------------------------
+    # 106〜111 仕掛品・製造原価（製造原価配列のみ）
+    # -----------------------------
+    v106, m106 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"期首仕掛品", r"期首.*仕掛", r"期首WIP"],
+        exclude_patterns=[]
+    )
+    _set_row(106, "期首仕掛品", v106, ("製造原価より: " + "、".join(m106)) if m106 else "製造原価より: 該当なし")
+
+    v108, m108 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"期末仕掛品", r"期末.*仕掛", r"期末WIP"],
+        exclude_patterns=[]
+    )
+    _set_row(108, "期末仕掛品", v108, ("製造原価より: " + "、".join(m108)) if m108 else "製造原価より: 該当なし")
+
+    v109, m109 = _sum_by_patterns(
+        seizo_list,
+        include_patterns=[r"他勘定振替", r"振替高"],
+        exclude_patterns=[]
+    )
+    _set_row(109, "他勘定振替高", v109, ("製造原価より: " + "、".join(m109)) if m109 else "製造原価より: 該当なし")
+
+    # 107 小計 = 84 + 89 + 105 + 106
+    v107_calc = [
+        int(row_dict.get(84, {}).get("今期", 0) or 0) + int(row_dict.get(89, {}).get("今期", 0) or 0) + int(row_dict.get(105, {}).get("今期", 0) or 0) + int(row_dict.get(106, {}).get("今期", 0) or 0),
+        int(row_dict.get(84, {}).get("前期", 0) or 0) + int(row_dict.get(89, {}).get("前期", 0) or 0) + int(row_dict.get(105, {}).get("前期", 0) or 0) + int(row_dict.get(106, {}).get("前期", 0) or 0),
+        int(row_dict.get(84, {}).get("前々期", 0) or 0) + int(row_dict.get(89, {}).get("前々期", 0) or 0) + int(row_dict.get(105, {}).get("前々期", 0) or 0) + int(row_dict.get(106, {}).get("前々期", 0) or 0),
+    ]
+    _set_row(107, "小計", v107_calc, "製造原価のみで計算（84+89+105+106）")
+
+    # 110 期首-期末仕掛品差額 = 106 - 108
+    v110_calc = [
+        int(row_dict.get(106, {}).get("今期", 0) or 0) - int(row_dict.get(108, {}).get("今期", 0) or 0),
+        int(row_dict.get(106, {}).get("前期", 0) or 0) - int(row_dict.get(108, {}).get("前期", 0) or 0),
+        int(row_dict.get(106, {}).get("前々期", 0) or 0) - int(row_dict.get(108, {}).get("前々期", 0) or 0),
+    ]
+    _set_row(110, "期首-期末仕掛品差額(V)", v110_calc, "製造原価のみで計算（106-108）")
+    row_dict[110]["区分"] = "V"
+
+    # 111 当期製造原価 = 107 - 108 - 109
+    v111_calc = [
+        int(row_dict.get(107, {}).get("今期", 0) or 0) - int(row_dict.get(108, {}).get("今期", 0) or 0) - int(row_dict.get(109, {}).get("今期", 0) or 0),
+        int(row_dict.get(107, {}).get("前期", 0) or 0) - int(row_dict.get(108, {}).get("前期", 0) or 0) - int(row_dict.get(109, {}).get("前期", 0) or 0),
+        int(row_dict.get(107, {}).get("前々期", 0) or 0) - int(row_dict.get(108, {}).get("前々期", 0) or 0) - int(row_dict.get(109, {}).get("前々期", 0) or 0),
+    ]
+    _set_row(111, "当期製造原価", v111_calc, "製造原価のみで計算（107-108-109）")
+
+    # 製造原価報告書の合計行（84, 89, 105, 107, 110, 111）は total-row 想定だが、ここでは数値確定のみ
+    # 区分の空欄行はそのまま維持（必要なら後段で表示用途に合わせて調整する）
+
+# 81〜111 を必ず製造原価配列のみで上書き確定
+_apply_seizo_only_81_111(row_dict, source_data)
+
+
+def to_int_safe_bs(s):
+    if s is None:
+        return 0
+    if isinstance(s, (int, float)):
+        return int(s)
+    s = str(s).replace(",", "").replace(" ", "").replace("　", "")
+    if s == "" or s == "-" or s == "ー":
+        return 0
+    if "△" in s or "▲" in s:
+        s = s.replace("△", "").replace("▲", "")
+        try:
+            return -int(s)
+        except:
+            return 0
+    try:
+        return int(s)
+    except:
+        return 0
+
+def get_vals(line_no):
+    r = row_dict.get(line_no, {"今期": 0, "前期": 0, "前々期": 0})
+    def extract(val):
+        if isinstance(val, dict):
+            return to_int_safe_bs(val.get("金額", 0))
+        return to_int_safe_bs(val)
+    return [extract(r.get("今期", 0)), extract(r.get("前期", 0)), extract(r.get("前々期", 0))]
+
+def set_vals(line_no, vals):
+    if line_no in row_dict:
+        row_dict[line_no]["今期"], row_dict[line_no]["前期"], row_dict[line_no]["前々期"] = vals
+        row_dict[line_no]["集計方法"] = "自動計算"
+
+def _fmt_triplet(v):
+    return f"今期={v[0]} 前期={v[1]} 前々期={v[2]}"
+
+def verify_total(line_no, label, calc_vals, detail_lines=None, note=None):
+    json_vals = get_vals(line_no)
+    diff = [calc_vals[j] - json_vals[j] for j in range(3)]
+    if diff != [0, 0, 0]:
+        print(f"---- 検算ログ：{label}({line_no}) 差異 ----")
+        print(f"  {line_no}(JSON/LLM): {_fmt_triplet(json_vals)}")
+        print(f"  計算値(PY)       : {_fmt_triplet(calc_vals)}")
+        print(f"  差異(PY-JSON)    : {_fmt_triplet(diff)}")
+        if note: print(f"  注記: {note}")
+        if detail_lines:
+            print("  内訳:")
+            for ln in detail_lines:
+                r = row_dict.get(ln, {})
+                v = get_vals(ln)
+                print(f"    {ln}: {r.get('勘定科目','')} 今期={v[0]} 前期={v[1]} 前々期={v[2]}")
+        print("--------------------------------------")
+
+# --- 合計行の計算ロジック実行 ---
+
+# BS各合計
+set_vals(6, [sum(x) for x in zip(get_vals(1), get_vals(3), get_vals(4), get_vals(5))])
+set_vals(11, [sum(x) for x in zip(get_vals(7), get_vals(8), get_vals(9), get_vals(10))])
+
+res22 = [0, 0, 0]
+for i in [12, 13, 14, 15, 16, 17, 18, 19, 21]:
+    vals = get_vals(i)
+    for j in range(3): res22[j] += vals[j]
+v20 = get_vals(20)
+for j in range(3): res22[j] -= abs(v20[j])
+set_vals(22, res22)
+
+set_vals(23, [sum(x) for x in zip(get_vals(6), get_vals(11), get_vals(22))])
+
+res32 = [0, 0, 0]
+for i in range(24, 32):
+    v = get_vals(i)
+    for j in range(3): res32[j] += v[j]
+set_vals(32, res32)
+
+res42 = [0, 0, 0]
+for i in [34, 35, 36, 37, 38, 39, 41]:
+    vals = get_vals(i)
+    for j in range(3): res42[j] += vals[j]
+v40 = get_vals(40)
+for j in range(3): res42[j] -= abs(v40[j])
+set_vals(42, res42)
+
+set_vals(44, [sum(x) for x in zip(get_vals(32), get_vals(33), get_vals(42))])
+set_vals(45, [sum(x) for x in zip(get_vals(23), get_vals(44), get_vals(43))])
+
+res56 = [0, 0, 0]
+for i in range(46, 56):
+    v = get_vals(i)
+    for j in range(3): res56[j] += v[j]
+set_vals(56, res56)
+
+calc64 = [0, 0, 0]
+for i in range(57, 64):
+    v = get_vals(i)
+    for j in range(3): calc64[j] += v[j]
+verify_total(64, "固定負債合計", calc64, range(57, 64))
+
+set_vals(65, [sum(x) for x in zip(get_vals(56), get_vals(64))])
+set_vals(71, [sum(x) for x in zip(get_vals(66), get_vals(67), get_vals(68))])
+v71, v72, v73 = get_vals(71), get_vals(72), get_vals(73)
+set_vals(74, [v71[j] - abs(v72[j]) + v73[j] for j in range(3)])
+set_vals(75, [sum(x) for x in zip(get_vals(65), get_vals(74))])
+set_vals(76, [get_vals(45)[j] - get_vals(75)[j] for j in range(3)])
+
+# 85: 賃金再集計
+seizo_list = source_data.get("製造原価", [])
+include_85 = [r"賃金", r"雑給", r"給料", r"給与", r"作業員給与", r"臨時雇", r"パート", r"アルバイト", r"手当"]
+exclude_85 = [r"賞与", r"退職", r"法定福利", r"厚生費", r"福利厚生", r"当期労務費", r"労務費合計"]
+# _sum_seizo_by_patterns -> _sum_bs_by_patterns (関数名の修正と引数合わせ)
+sum85, matched85 = _sum_bs_by_patterns(seizo_list, include_85, exclude_85)
+
+if 85 in row_dict:
+    row_dict[85]["今期"], row_dict[85]["前期"], row_dict[85]["前々期"] = sum85
+    row_dict[85]["集計方法"] = "再集計: " + "、".join(matched85) if matched85 else "再集計: 該当なし"
+
+set_vals(89, [sum(x) for x in zip(get_vals(85), get_vals(86), get_vals(87), get_vals(88))])
+
+# -------------------------------------------------
+# 区分の強制補正（恒久対応）
+# 85～88 行は必ず F
+# -------------------------------------------------
+for rn in range(85, 89):
+    if rn not in row_dict:
+        row_dict[rn] = {"行番号": rn}
+    row_dict[rn]["区分"] = "F"
+
+
+# 105: 当期製造経費
+calc105 = [0, 0, 0]
+for ln in range(90, 105):
+    v = get_vals(ln)
+    for j in range(3): calc105[j] += v[j]
+set_vals(105, calc105)
+
+# 107: 小計
+set_vals(107, [get_vals(84)[j] + get_vals(89)[j] + get_vals(105)[j] + get_vals(106)[j] for j in range(3)])
+row_dict[107]["勘定科目"] = "小計"
+
+set_vals(110, [get_vals(106)[j] - get_vals(108)[j] for j in range(3)])
+set_vals(111, [get_vals(107)[j] - get_vals(108)[j] - get_vals(109)[j] for j in range(3)])
+
+# --- 124: 法定福利費・福利厚生費の修正集計 ---
+# 販管費リスト(rows_pl)から抽出
+# rows_pl を辞書化し、勘定科目名で検索できるように簡易化
+hankan_rows = source_data.get("販売費", []) # 元データから直接取得
+
+sum124, matched124 = _sum_bs_by_patterns(hankan_rows, [r"法定福利", r"福利厚生", r"厚生費"], [])
+
+# 製造原価側に同科目の金額があるか確認（備考出力の判定用）
+sum124_seizo, _ = _sum_bs_by_patterns(seizo_list, [r"法定福利", r"福利厚生", r"厚生費"], [])
+
+if 124 in row_dict:
+    row_dict[124]["今期"], row_dict[124]["前期"], row_dict[124]["前々期"] = sum124
+
+    # 判定：販管費側が0で、製造原価側に金額がある場合
+    is_zero_pl = (sum124[0] == 0 and sum124[1] == 0 and sum124[2] == 0)
+    has_val_seizo = (sum124_seizo[0] != 0 or sum124_seizo[1] != 0 or sum124_seizo[2] != 0)
+
+    if is_zero_pl and has_val_seizo:
+        row_dict[124]["集計方法"] = "製造原価に集計"
+    else:
+        row_dict[124]["集計方法"] = "再集計(販管費のみ): " + "、".join(matched124) if matched124 else "再集計: 該当なし"
+
+# --- PL残りのロジック ---
+set_vals(118, [get_vals(113)[j] - get_vals(117)[j] for j in range(3)])
+set_vals(120, [get_vals(112)[j] - get_vals(119)[j] for j in range(3)])
+
+# --- PL合計（139行目）を先に取得 ---
+# PLデータ(rows_pl)から「合計」行を探す
+pl_total_vals = [0, 0, 0]
+for item in rows_pl:
+    if "合計" in item.get("勘定科目", ""):
+        pl_total_vals = [
+            to_int_safe_bs(item.get("今期", 0)),
+            to_int_safe_bs(item.get("前期", 0)),
+            to_int_safe_bs(item.get("前々期", 0))
+        ]
+        break
+
+# 139行目にセット
+set_vals(139, pl_total_vals)
+
+# --- 138: その他雑費を「差し引き」で算出 ---
+# 121〜137までの合計を計算
+sum_121_137 = [0, 0, 0]
+for i in range(121, 138):
+    v = get_vals(i)
+    for j in range(3):
+        sum_121_137[j] += v[j]
+
+# 138 = 合計(139) - 内訳合計(sum_121_137)
+res138 = [pl_total_vals[j] - sum_121_137[j] for j in range(3)]
+set_vals(138, res138)
+row_dict[138]["集計方法"] = "自動計算(差引算出)"
+
+# 検算ログ（確認用）
+verify_total(139, "販管費合計", pl_total_vals, range(121, 139))
+
+
+# 139: 販管費合計
+calc139 = [0, 0, 0]
+for i in range(121, 139):
+    v = get_vals(i)
+    for j in range(3): calc139[j] += v[j]
+verify_total(139, "販管費合計", calc139, range(121, 139))
+
+set_vals(145, [sum(x) for x in zip(get_vals(141), get_vals(142), get_vals(143), get_vals(144))])
+set_vals(148, [sum(x) for x in zip(get_vals(146), get_vals(147))])
+set_vals(149, [get_vals(140)[j] + get_vals(145)[j] - get_vals(148)[j] for j in range(3)])
+set_vals(152, [get_vals(149)[j] + get_vals(150)[j] - get_vals(151)[j] for j in range(3)])
+set_vals(154, [get_vals(152)[j] - get_vals(153)[j] for j in range(3)])
+
+# 出力
+final_rows = [row_dict[i] for i in sorted(row_dict.keys())]
+with Path("aggregated_all.json").open("w", encoding="utf-8") as f:
+    json.dump(final_rows, f, ensure_ascii=False, indent=2)
+with Path("aggregated_all.csv").open("w", encoding="cp932", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["行番号", "勘定科目", "前々期", "前期", "今期", "区分", "集計方法"])
+    for row in final_rows:
+        writer.writerow([row["行番号"], row["勘定科目"], row["前々期"], row["前期"], row["今期"], row["区分"], row["集計方法"]])
+
+print("販管費の集計範囲を修正し、再計算を完了しました。")

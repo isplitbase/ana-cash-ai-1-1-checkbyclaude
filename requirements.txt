@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+openai>=2.0.0
+python-dotenv
+openpyxl==3.1.5
+boto3
+anthropic
