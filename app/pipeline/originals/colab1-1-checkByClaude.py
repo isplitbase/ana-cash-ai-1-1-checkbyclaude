@@ -212,7 +212,7 @@ import re
 import json
 from pathlib import Path
 
-MODEL  = "claude-sonnet-4-5-20250929"
+MODEL  = "claude-sonnet-4-6"
 MODEL = os.getenv("CLAUDE_MODEL", MODEL)
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
