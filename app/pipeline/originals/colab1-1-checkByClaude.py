@@ -212,8 +212,8 @@ import re
 import json
 from pathlib import Path
 
-MODEL  = "claude-sonnet-4-6"
-MODEL = os.getenv("CLAUDE_MODEL", MODEL)
+from model_resolver import resolve_model
+MODEL = resolve_model()   # CLAUDE_MODEL → claude-sonnet-4-6 → 使えるモデルへ自動フォールバック
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
