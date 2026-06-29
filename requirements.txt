@@ -5,3 +5,4 @@ python-dotenv
 openpyxl==3.1.5
 boto3
 anthropic
+google-cloud-storage

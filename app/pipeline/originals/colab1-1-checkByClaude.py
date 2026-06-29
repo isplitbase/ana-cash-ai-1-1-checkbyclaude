@@ -164,6 +164,33 @@ def _download_s3(uri: str, out_dir: Path, index: int):
     _s3_client().download_file(bucket, key, str(local))
     return str(local)
 
+def _parse_gs_uri(uri: str):
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Unsupported uri (expected gs://...): {uri}")
+    no_scheme = uri[len("gs://"):]
+    parts = no_scheme.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"Invalid gs uri: {uri}")
+    return parts[0], parts[1]
+
+def _download_gcs(uri: str, out_dir: Path, index: int):
+    # GCS からPDFをダウンロード（Cloud Run のサービスアカウント=ADC を使用）。
+    from google.cloud import storage  # 遅延import
+    bucket_name, key = _parse_gs_uri(uri)
+    base = Path(key).name or f"input_{index}.pdf"
+    stem = Path(base).stem
+    suffix = Path(base).suffix or ".pdf"
+    local = out_dir / f"{stem}_{index}{suffix}"
+    n = 1
+    while local.exists():
+        local = out_dir / f"{stem}_{index}_{n}{suffix}"
+        n += 1
+    project = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    client = storage.Client(project=project) if project else storage.Client()
+    client.bucket(bucket_name).blob(key).download_to_filename(str(local))
+    return str(local)
+
+
 def _read_payload():
     raw = sys.stdin.read()
     if not raw.strip():
@@ -179,6 +206,8 @@ try:
     for i, uri in enumerate(_split_pdfurls(payload.get("pdfurls")), start=1):
         if uri.startswith("s3://"):
             pdf_paths.append(_download_s3(uri, Path(WORKDIR), i))
+        elif uri.startswith("gs://"):
+            pdf_paths.append(_download_gcs(uri, Path(WORKDIR), i))
         else:
             raise ValueError(f"Unsupported pdf url scheme: {uri}")
 
