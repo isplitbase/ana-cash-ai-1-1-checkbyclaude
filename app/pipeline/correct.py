@@ -228,6 +228,33 @@ def _failing(checks: Dict[str, bool]) -> set:
 # ------------------------------------------------------------
 # PDF の取得
 # ------------------------------------------------------------
+IMAGE_MAX_EDGE = int(os.getenv("CORRECT_IMAGE_MAX_EDGE", "2400"))   # 長い辺の画素数（Claude の画像の上限 5MB に収める）
+
+
+def _download_images(urls: List[str]) -> List[Tuple[str, bytes]]:
+    """ページ画像（https の署名付き URL・gs://）を取得し、JPEG に縮めて返す（z-lite 用。z-lite は PDF を保存しないため）"""
+    import io
+    import httpx
+    from PIL import Image
+    out = []
+    for i, uri in enumerate(urls, start=1):
+        if uri.startswith("gs://"):
+            from google.cloud import storage
+            bucket, key = uri[len("gs://"):].split("/", 1)
+            raw = storage.Client().bucket(bucket).blob(key).download_as_bytes()
+        else:
+            r = httpx.get(uri, timeout=60, follow_redirects=True)
+            r.raise_for_status()
+            raw = r.content
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if max(img.size) > IMAGE_MAX_EDGE:
+            img.thumbnail((IMAGE_MAX_EDGE, IMAGE_MAX_EDGE))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88)
+        out.append((f"ページ{i}", buf.getvalue()))
+    return out
+
+
 def _download_pdfs(urls: List[str], workdir: Path) -> List[Tuple[str, bytes]]:
     pdfs = []
     for i, uri in enumerate(urls, start=1):
@@ -248,6 +275,7 @@ def _download_pdfs(urls: List[str], workdir: Path) -> List[Tuple[str, bytes]]:
 # ------------------------------------------------------------
 PROMPT = """あなたは決算書の読取結果を直す担当者です。
 添付の決算書PDFと、下の「読取結果」（PDFをOCRで読み取ったもの）を見比べ、読取結果の誤りの直し方を出してください。
+（PDFの代わりにページ画像が添付されているときは、画像を決算書のページとして扱う。画像の前の【ページn】が page_no = n に当たる。）
 
 ## 探すもの
 - 読み違い：PDFと金額が違う（桁・数字の読み違い、△▲のマイナスの付け忘れ・付け過ぎ）
@@ -344,10 +372,16 @@ def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -
     if not api_key:
         raise AIUnavailable([{"model": "-", "error": "ANTHROPIC_API_KEY が設定されていません"}])
     client = anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=300)
-    content = [{"type": "document", "title": name,
-                "source": {"type": "base64", "media_type": "application/pdf",
-                           "data": base64.standard_b64encode(b).decode("ascii")}}
-               for name, b in pdfs]
+    content = []
+    for name, b in pdfs:
+        if b[:4] == b"%PDF":
+            content.append({"type": "document", "title": name,
+                            "source": {"type": "base64", "media_type": "application/pdf",
+                                       "data": base64.standard_b64encode(b).decode("ascii")}})
+        else:   # ページ画像（z-lite）。page_no と対応させるため、画像の前にページ番号を書く
+            content.append({"type": "text", "text": f"【{name}】（page_no = {name.replace('ページ', '')}）"})
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                        "data": base64.standard_b64encode(b).decode("ascii")}})
     content.append({"type": "text", "text": PROMPT.format(read_data=read_data)})
 
     models = []
@@ -471,14 +505,16 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     resp = payload.get("response") or {}
     if not isinstance(resp, dict) or not any(resp.get(s) for s in SECTIONS):
         return {"status": "error", "message": "response（読取結果）がありません"}
-    pdfurls = payload.get("pdfurls") or []
-    if isinstance(pdfurls, str):
-        pdfurls = [u for u in pdfurls.split("|,|") if u.strip()]
-    if not pdfurls:
-        return {"status": "error", "message": "pdfurls がありません"}
+    split = lambda v: [u.strip() for u in (v.split("|,|") if isinstance(v, str) else (v or [])) if str(u).strip()]
+    pdfurls, image_urls = split(payload.get("pdfurls")), split(payload.get("image_urls"))
+    if not pdfurls and not image_urls:
+        return {"status": "error", "message": "pdfurls も image_urls もありません"}
 
-    with tempfile.TemporaryDirectory(prefix="correct_") as td:
-        pdfs = _download_pdfs(pdfurls, Path(td))
+    if pdfurls:          # ana：PDF をそのまま渡す
+        with tempfile.TemporaryDirectory(prefix="correct_") as td:
+            pdfs = _download_pdfs(pdfurls, Path(td))
+    else:                # z-lite：PDF を保存しないので、読取に使ったページ画像を渡す（画像の順番＝page_no）
+        pdfs = _download_images(image_urls)
     read_data, index = _compact(resp)
     try:
         raw, model, attempts, raw_merges = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
