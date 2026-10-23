@@ -307,6 +307,8 @@ PDFでは同じ1つの科目なのに、読み違いで期ごとに別の名前�
 - 同じ表（BS・PL・販売費・製造原価）の中の行どうしだけ。from の値は、keep が空欄の期に移す。
 - 両方の行に同じ期の値があり、その値が違う場合はまとめない（別の科目なので）。
 - PDFで同じ科目だと確かめられたものだけ。名前が似ているだけの別の科目はまとめない。
+- 行は分かれていないが、科目名そのものを読み違えている行（例：PDFは「保険掛金」なのに3期とも「保険積立金」）は、
+  from を書かずに keep と name だけを出す（科目名だけ直す）。書き方の違い（「売上総利益金額」と「売上総利益」など）は直さない。
 
 ## 読取結果（id は行の番号）
 ```json
@@ -461,7 +463,26 @@ def _apply_merges(resp: dict, merges: List[dict], index, fail_cur: set) -> Tuple
     current = resp
     merged, rejected, drop = [], [], set()
     for m in merges or []:
-        if not isinstance(m, dict) or m.get("keep") not in index or m.get("from") not in index or m.get("keep") == m.get("from"):
+        if not isinstance(m, dict) or m.get("keep") not in index:
+            continue
+        if not m.get("from"):
+            # 科目名だけの直し（行は分かれていない）。直しても検算が変わらない（合わなくなる・検算できなくなる項目が無い）ときだけ
+            s1, i1 = index[m["keep"]]
+            name = str(m.get("name") or "").strip()
+            old = current[s1][i1].get("勘定科目", "")
+            if not name or _norm(name) == _norm(old):
+                continue
+            trial = copy.deepcopy(current)
+            trial[s1][i1]["勘定科目"] = name
+            checks_before, checks_trial = run_checks(current), run_checks(trial)
+            if _failing(checks_trial) - fail_cur or set(checks_before) - set(checks_trial):
+                rejected.append({"section": s1, "keep": old, "from": "", "name": name, "reason": m.get("reason", ""),
+                                 "why": "科目名を変えると検算が変わる"})
+                continue
+            current = trial
+            merged.append({"section": s1, "keep": old, "from": "", "name": name, "reason": m.get("reason", "")})
+            continue
+        if m.get("from") not in index or m.get("keep") == m.get("from"):
             continue
         (s1, i1), (s2, i2) = index[m["keep"]], index[m["from"]]
         keep, src = current[s1][i1], current[s2][i2]
@@ -581,6 +602,25 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
                 # 合計を壊さないので反映する
                 applied += [{**_describe(c, current, index), "note": "行ずれの直し（値の入れ替えのみ）"} for c in items]
                 current, pass_cur, progress = trial, pass_trial, True
+            else:
+                rest.append(items)
+        pending = rest
+    # 1つずつでは裏付けが取れなかった修正を、同じ表・同じ期ごとにまとめてもう一度試す
+    # （例：期首・合計・期末の3つが全部 0 と読まれたときは、3つそろって直さないと検算が合わない）
+    if pending:
+        bundles: Dict[Tuple[str, str], List[dict]] = {}
+        for items in pending:
+            for c in items:
+                bundles.setdefault((index[c["id"]][0], c["period"]), []).append(c)
+        rest = []
+        for items in bundles.values():
+            trial = _apply(current, items, index)
+            checks_trial = run_checks(trial)
+            fail_trial = _failing(checks_trial)
+            pass_trial = {k for k, ok in checks_trial.items() if ok}
+            if len(items) > 1 and (fail_trial < fail_cur or (fail_trial <= fail_cur and pass_trial > pass_cur)):
+                applied += [{**_describe(c, current, index), "note": "同じ表・同じ期の修正をまとめて検算"} for c in items]
+                current, fail_cur, pass_cur = trial, fail_trial, pass_trial
             else:
                 rest.append(items)
         pending = rest
