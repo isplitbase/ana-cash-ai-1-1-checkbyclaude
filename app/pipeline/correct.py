@@ -111,7 +111,8 @@ def run_checks(resp: dict) -> Dict[str, bool]:
             for row in rows:
                 groups.setdefault(_norm(row.get("分類")), []).append(row)
             for g, members in groups.items():
-                if not g:
+                # 入れ子になっていて単純な足し算にならない分類は、下の個別の検算で見る
+                if not g or g in ("利益剰余金", "売上原価", "純資産", "株主資本", "その他利益剰余金"):
                     continue
                 totals = [r for r in members if _norm(r.get("勘定科目")) == g]
                 details = [r for r in members if _norm(r.get("勘定科目")) != g]
@@ -139,6 +140,29 @@ def run_checks(resp: dict) -> Dict[str, bool]:
         if None not in (fixed, tang, intang, inv):
             add(f"【{p}】BS:固定資産＝有形＋無形＋投資", tang + intang + inv, fixed)
 
+        # 2b) 純資産の内訳（2026-10-23 追加。マイナスの付け忘れ・付け過ぎを検算で確かめるため）
+        sh = g(bs, "株主資本")
+        valu = g(bs, "評価・換算差額等", "評価換算差額等")
+        warr = g(bs, "新株予約権")
+        minority = g(bs, "非支配株主持分")
+        if None not in (equity, sh):
+            add(f"【{p}】BS:純資産＝株主資本＋評価換算差額等＋新株予約権", sh + (valu or 0) + (warr or 0) + (minority or 0), equity)
+        cap, capsur, retained = g(bs, "資本金"), g(bs, "資本剰余金"), g(bs, "利益剰余金")
+        treasury = g(bs, "自己株式")
+        if None not in (sh, cap, retained):
+            t = 0 if treasury is None else (treasury if treasury < 0 else -treasury)   # 自己株式は差し引く
+            add(f"【{p}】BS:株主資本＝資本金＋資本剰余金＋利益剰余金−自己株式", cap + (capsur or 0) + retained + t, sh)
+        legal, other_re = g(bs, "利益準備金"), g(bs, "その他利益剰余金")
+        if None not in (retained, legal, other_re):
+            add(f"【{p}】BS:利益剰余金＝利益準備金＋その他利益剰余金", legal + other_re, retained)
+        carried = g(bs, "繰越利益剰余金")
+        if None not in (other_re, carried):
+            # その他利益剰余金 ＝ 任意積立金（〜積立金・利益準備金以外の〜準備金）＋ 繰越利益剰余金
+            reserves = [_get(r, p) for r in bs
+                        if re.search(r"(積立金|準備金)$", _norm(r.get("勘定科目")))
+                        and _norm(r.get("勘定科目")) not in ("利益準備金", "資本準備金")]
+            add(f"【{p}】BS:その他利益剰余金＝積立金＋繰越利益剰余金", sum(v or 0 for v in reserves) + carried, other_re)
+
         # 3) PL の利益の流れ
         sales, cogs, gross = g(pl, "売上高"), g(pl, "売上原価"), g(pl, "売上総利益")
         sgna, op = g(pl, "販売費及び一般管理費"), g(pl, "営業利益")
@@ -150,6 +174,21 @@ def run_checks(resp: dict) -> Dict[str, bool]:
         net = g(pl, "当期純利益", "当期利益")
         if None not in (sales, cogs, gross):
             add(f"【{p}】PL:売上総利益", sales - cogs, gross)
+
+        # 3b) 売上原価の流れ（2026-10-23 追加）：売上原価 ＝ 合計 − 期末棚卸
+        #     合計 ＝ 期首棚卸 ＋ 仕入（リベート等の控除を含む）＋ 当期製品製造原価
+        begin = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期首")), None)
+        end = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期末")), None)
+        subtotal = _find(pl, "合計", "売上原価合計")
+        if cogs is not None and end is not None and subtotal is not None and None not in (_get(end, p), _get(subtotal, p)):
+            add(f"【{p}】PL:売上原価＝合計−期末棚卸", _get(subtotal, p) - _get(end, p), cogs)
+        if begin is not None and end is not None and subtotal is not None and _get(subtotal, p) is not None:
+            i0, i1 = pl.index(begin), pl.index(subtotal)
+            if i0 < i1:
+                # 途中の小計・別名の合計の行（「合計（仕入）」など）は二重に数えないよう除く
+                parts = [_get(r, p) for r in pl[i0:i1] if not re.search(r"(合計|小計)", _norm(r.get("勘定科目")))]
+                if any(v is not None for v in parts):
+                    add(f"【{p}】PL:合計＝期首＋仕入＋製造原価", sum(v or 0 for v in parts), _get(subtotal, p))
         if None not in (gross, sgna, op):
             add(f"【{p}】PL:営業利益", gross - sgna, op)
         if None not in (op, ninc, nexp, ordi):
@@ -415,6 +454,7 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         groups.setdefault(c["group"], []).append(c)
 
     current, fail_cur = resp, fail_before
+    pass_cur = {k for k, ok in before.items() if ok}
     applied, rejected, unverified = [], [], []
     pending = list(groups.values())
     progress = True
@@ -423,17 +463,21 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         rest = []
         for items in pending:
             trial = _apply(current, items, index)
-            fail_trial = _failing(run_checks(trial))
-            if fail_trial < fail_cur:    # 合わなかった検算が減り、新しく合わなくなる検算が無い
+            checks_trial = run_checks(trial)
+            fail_trial = _failing(checks_trial)
+            pass_trial = {k for k, ok in checks_trial.items() if ok}
+            if fail_trial < fail_cur or (fail_trial <= fail_cur and pass_trial > pass_cur):
+                # 合わなかった検算が減る、または合う検算が増える（空欄が埋まって新しく検算できるようになり、それが合う）
+                # どちらも、新しく合わなくなる検算が無いことが条件
                 applied += [_describe(c, current, index) for c in items]
-                current, fail_cur, progress = trial, fail_trial, True
+                current, fail_cur, pass_cur, progress = trial, fail_trial, pass_trial, True
             elif fail_trial - fail_cur:  # 新しく合わなくなる検算がある＝修正案の方が誤り
                 rejected += [{**_describe(c, current, index), "why": "検算が合わなくなる"} for c in items]
             elif _is_rearrangement(current, items, index):
                 # 同じ表・同じ期の中で値を入れ替えるだけ（行ずれの直し）は合計が変わらないので検算では確かめられないが、
                 # 合計を壊さないので反映する
                 applied += [{**_describe(c, current, index), "note": "行ずれの直し（値の入れ替えのみ）"} for c in items]
-                current, progress = trial, True
+                current, pass_cur, progress = trial, pass_trial, True
             else:
                 rest.append(items)
         pending = rest
