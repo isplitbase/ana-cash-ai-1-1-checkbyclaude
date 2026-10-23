@@ -265,6 +265,14 @@ PROMPT = """あなたは決算書の読取結果を直す担当者です。
 - PDFで確かめられない値は直さない。推測で直さない。合っている値は挙げない。
 - 科目名の書き方の違い（「売上総利益金額」と「売上総利益」など）は直さない。
 
+## 行のまとめ（merges）
+PDFでは同じ1つの科目なのに、読み違いで期ごとに別の名前の行に分かれているものを、1つの行にまとめる。
+（例：今期は「保険掛金」、前期は「保険積立金」の行に入っている／前期だけ「（1）利益準備金」「別途積立金」になっている）
+- keep（残す行の id）と from（keep に移して消す行の id）、name（PDFに書かれている正しい科目名）を出す。
+- 同じ表（BS・PL・販売費・製造原価）の中の行どうしだけ。from の値は、keep が空欄の期に移す。
+- 両方の行に同じ期の値があり、その値が違う場合はまとめない（別の科目なので）。
+- PDFで同じ科目だと確かめられたものだけ。名前が似ているだけの別の科目はまとめない。
+
 ## 読取結果（id は行の番号）
 ```json
 {read_data}
@@ -275,10 +283,13 @@ PROMPT = """あなたは決算書の読取結果を直す担当者です。
 {{
   "corrections": [
     {{"id": "BS-5", "period": "前々期", "value": 13049, "group": "g1", "pdf": "前々期のBS 預け金 13,049", "reason": "前々期の流動資産が1行ずれている"}}
+  ],
+  "merges": [
+    {{"keep": "BS-17", "from": "BS-18", "name": "保険掛金", "reason": "3期ともPDFは「保険掛金」。前期・今期だけ「保険積立金」の行に分かれている"}}
   ]
 }}
 ```
-誤りが無ければ {{"corrections": []}} を返す。
+誤りが無ければ {{"corrections": [], "merges": []}} を返す。
 """
 
 
@@ -324,8 +335,8 @@ def log_event(severity: str, event: str, **fields) -> None:
     print(json.dumps({"severity": severity, "event": event, **fields}, ensure_ascii=False), flush=True)
 
 
-def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -> Tuple[List[dict], str, List[dict]]:
-    """修正案を出させる。戻り値は (修正案, 使ったモデル, 試したモデルの記録)。
+def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -> Tuple[List[dict], str, List[dict], List[dict]]:
+    """修正案を出させる。戻り値は (金額の修正案, 使ったモデル, 試したモデルの記録, 行のまとめ案)。
     利用制限（429）・混雑（529）・サーバエラー・通信エラー・時間切れのときは、SDK の自動リトライのあと次のモデルに切り替える。
     どれも使えなければ AIUnavailable を投げる（呼び出し側は修正せずに元の読取結果を返す）。"""
     import anthropic
@@ -365,11 +376,13 @@ def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -
                 break
             text = "".join(b.text for b in msg.content if hasattr(b, "text"))
             try:
-                corr = _parse_json(text).get("corrections", [])
+                obj = _parse_json(text)
+                corr = obj.get("corrections", [])
+                merges = obj.get("merges", []) or []
                 if isinstance(corr, list):
                     if attempts:
                         log_event("WARNING", "ai_correct_fallback_used", ai_case_id=ai_case_id, model=model, attempts=attempts)
-                    return corr, model, attempts
+                    return corr, model, attempts, (merges if isinstance(merges, list) else [])
                 raise ValueError("corrections が配列ではない")
             except Exception as e:
                 attempts.append({"model": model, "error": "JSON が読めない", "detail": str(e)[:300]})
@@ -400,6 +413,52 @@ def _is_rearrangement(resp: dict, items: List[dict], index) -> bool:
     return before == after and len(after) > 0
 
 
+def _apply_merges(resp: dict, merges: List[dict], index, fail_cur: set) -> Tuple[dict, List[dict], List[dict]]:
+    """行のまとめ案を確かめて反映する。
+    条件：同じ表の2行・同じ期に違う値が入っていない・まとめても新しく合わなくなる検算が無い。
+    確かめる間は from の行を空欄にしておき、最後にまとめて消す（行番号がずれないように）。"""
+    current = resp
+    merged, rejected, drop = [], [], set()
+    for m in merges or []:
+        if not isinstance(m, dict) or m.get("keep") not in index or m.get("from") not in index or m.get("keep") == m.get("from"):
+            continue
+        (s1, i1), (s2, i2) = index[m["keep"]], index[m["from"]]
+        keep, src = current[s1][i1], current[s2][i2]
+        info = {"section": s1, "keep": keep.get("勘定科目", ""), "from": src.get("勘定科目", ""),
+                "name": str(m.get("name") or keep.get("勘定科目", "")), "reason": m.get("reason", "")}
+        if s1 != s2 or (s2, i2) in drop:
+            rejected.append({**info, "why": "別の表の行・すでにまとめた行"})
+            continue
+        clash = [p for p in PERIODS if _get(keep, p) is not None and _get(src, p) is not None and _get(keep, p) != _get(src, p)]
+        if clash:
+            rejected.append({**info, "why": f"同じ期に違う値がある（{'・'.join(clash)}）"})
+            continue
+        trial = copy.deepcopy(current)
+        k, f = trial[s1][i1], trial[s2][i2]
+        for p in PERIODS:
+            if _get(k, p) is None and _get(f, p) is not None:
+                k[p] = copy.deepcopy(f[p])
+            _set(f, p, None)
+        if m.get("name"):
+            k["勘定科目"] = str(m["name"])
+        fail_trial = _failing(run_checks(trial))
+        if fail_trial - fail_cur:
+            rejected.append({**info, "why": "検算が合わなくなる"})
+            continue
+        current, fail_cur = trial, fail_trial
+        drop.add((s2, i2))
+        merged.append(info)
+    if drop:
+        current = copy.deepcopy(current)
+        for sec in SECTIONS:
+            idx = sorted((i for s, i in drop if s == sec), reverse=True)
+            for i in idx:
+                del current[sec][i]
+    if merged:
+        log_event("INFO", "ai_correct_merged", merged=[f"{x['keep']}+{x['from']}→{x['name']}" for x in merged])
+    return current, merged, rejected
+
+
 def _describe(c: dict, resp: dict, index) -> dict:
     sec, i = index[c["id"]]
     row = resp[sec][i]
@@ -422,12 +481,13 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         pdfs = _download_pdfs(pdfurls, Path(td))
     read_data, index = _compact(resp)
     try:
-        raw, model, attempts = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
+        raw, model, attempts, raw_merges = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
     except AIUnavailable as e:
         # AI が使えなかったときはエラーにせず、修正しないまま返す（読取はそのまま続けられる）
         return {"status": "skipped", "ai_case_id": payload.get("ai_case_id"),
                 "message": "AI が使えなかったため、読取結果は修正していません",
                 "attempts": e.attempts, "response": resp, "applied": [], "rejected": [], "unverified": [],
+                "merged": [], "merge_rejected": [],
                 "created_at": datetime.now(timezone.utc).isoformat()}
 
     # 形の正しい修正案だけ残す（存在する行・期、整数か null、今と違う値）
@@ -484,9 +544,12 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     for items in pending:                # 検算に関係しない修正は反映しない（画面での確認用に返す）
         unverified += [_describe(c, current, index) for c in items]
 
+    # 行のまとめ（期ごとに別の名前の行に分かれた同じ科目を1行にする）
+    current, merged, merge_rejected = _apply_merges(current, raw_merges, index, fail_cur)
+
     after = run_checks(current)
     log_event("INFO", "ai_correct_done", ai_case_id=payload.get("ai_case_id"), model=model,
-              applied=len(applied), rejected=len(rejected), unverified=len(unverified),
+              applied=len(applied), rejected=len(rejected), unverified=len(unverified), merged=len(merged),
               checks_failed_before=len(fail_before), checks_failed_after=len(_failing(after)))
     return {
         "status": "ok",
@@ -497,6 +560,8 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         "applied": applied,
         "rejected": rejected,
         "unverified": unverified,
+        "merged": merged,
+        "merge_rejected": merge_rejected,
         "checks_before": sorted(fail_before),
         "checks_after": sorted(_failing(after)),
         "checks_total": len(after),
