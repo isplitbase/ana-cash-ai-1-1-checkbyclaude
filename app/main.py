@@ -14,6 +14,15 @@ def checkbyclaude(payload: Dict[str, Any] = Body(...)):
     # 想定入力: ai_case_id / postingPeriod / BS / PL / pdfurls / ... など
     return run_check_by_claude(payload)
 
+# 読取結果を PDF と見比べて直す（2026-10-23）。検算で裏付けが取れた修正だけを反映して返す
+@app.post("/v1/correct")
+def correct(payload: Dict[str, Any] = Body(...)):
+    from app.pipeline.correct import correct_response
+    try:
+        return correct_response(payload)
+    except Exception as e:
+        return {"status": "error", "message": "読取結果の修正に失敗しました", "detail": str(e)[:2000]}
+
 # /v1/pipeline は本APIのメインエンドポイント（呼ばれたら checkByClaude を実行）
 # 互換のため /v1/checkbyclaude も残しています（どちらも同じ処理）
 @app.post("/v1/pipeline")
