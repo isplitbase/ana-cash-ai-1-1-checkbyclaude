@@ -20,6 +20,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -543,12 +544,68 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
             pdfs = _download_pdfs(pdfurls, Path(td))
     else:                # z-lite：PDF を保存しないので、読取に使ったページ画像を渡す（画像の順番＝page_no）
         pdfs = _download_images(image_urls)
+    ai_case_id = payload.get("ai_case_id")
+
+    # 修正を何回か重ねる（2026-10-23）。前の回で直した読取結果を、間隔をあけて AI にもう一度見せる。
+    # 回数は payload の passes か環境変数 CORRECT_PASSES（既定 3）、間隔は CORRECT_PASS_INTERVAL 秒（既定 15）。
+    # Cloud Run の時間切れを避けるため、CORRECT_TIME_BUDGET 秒（既定 220）を超えそうなら次の回はやめる。
+    passes = max(1, int(payload.get("passes") or os.getenv("CORRECT_PASSES", "3")))
+    interval = int(os.getenv("CORRECT_PASS_INTERVAL", "15"))
+    budget = int(os.getenv("CORRECT_TIME_BUDGET", "220"))
+    started = time.time()
+    results: List[dict] = []
+    current = resp
+    for n in range(1, passes + 1):
+        if n > 1:
+            if time.time() - started + interval + 40 > budget:
+                log_event("WARNING", "ai_correct_pass_skipped", ai_case_id=ai_case_id, pass_no=n,
+                          elapsed=int(time.time() - started))
+                break
+            time.sleep(interval)
+        carry = (results[-1].get("unverified") or []) if results else []
+        r = _correct_once(current, pdfs, ai_case_id, carry)
+        r["pass"] = n
+        results.append(r)
+        if r.get("status") != "ok":
+            break
+        current = r["response"]
+
+    ok = [r for r in results if r.get("status") == "ok"]
+    if not ok:
+        return results[0]
+    tag = lambda key: [{**x, "pass": r["pass"]} for r in ok for x in (r.get(key) or [])]
+    return {
+        "status": "ok",
+        "ai_case_id": ai_case_id,
+        "model": ok[-1]["model"],
+        "passes_done": len(ok),
+        "pass_summary": [{"pass": r["pass"], "model": r["model"], "applied": len(r["applied"]),
+                          "rejected": len(r["rejected"]), "unverified": len(r["unverified"]),
+                          "merged": len(r["merged"]), "checks_failed_after": len(r["checks_after"])} for r in ok],
+        "attempts": [a for r in results for a in (r.get("attempts") or [])],
+        "response": current,
+        "applied": tag("applied"),
+        "rejected": tag("rejected"),
+        "unverified": tag("unverified") if len(ok) == 1 else [{**x, "pass": ok[-1]["pass"]} for x in ok[-1]["unverified"]],
+        "merged": tag("merged"),
+        "merge_rejected": tag("merge_rejected"),
+        "checks_before": ok[0]["checks_before"],
+        "checks_after": ok[-1]["checks_after"],
+        "checks_total": ok[-1]["checks_total"],
+        "seconds": int(time.time() - started),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _correct_once(resp: dict, pdfs: List[Tuple[str, bytes]], ai_case_id, carry: Optional[List[dict]] = None) -> Dict[str, Any]:
+    """AI に1回修正案を出させ、検算で裏付けが取れたものを反映する。
+    carry は前の回で保留になった修正（今回の修正案と一緒に、もう一度検算する）"""
     read_data, index = _compact(resp)
     try:
-        raw, model, attempts, raw_merges = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
+        raw, model, attempts, raw_merges = ask_claude(pdfs, read_data, ai_case_id)
     except AIUnavailable as e:
         # AI が使えなかったときはエラーにせず、修正しないまま返す（読取はそのまま続けられる）
-        return {"status": "skipped", "ai_case_id": payload.get("ai_case_id"),
+        return {"status": "skipped", "ai_case_id": ai_case_id,
                 "message": "AI が使えなかったため、読取結果は修正していません",
                 "attempts": e.attempts, "response": resp, "applied": [], "rejected": [], "unverified": [],
                 "merged": [], "merge_rejected": [],
@@ -568,6 +625,19 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         if _get(resp[sec][i], c["period"]) == v:
             continue
         cands.append({**c, "value": v, "group": str(c.get("group") or c["id"] + c["period"])})
+
+    # 前の回で保留になった修正を引き継ぐ（行番号は回ごとに変わるので、表と科目名で今回の行を探す）
+    have = {(c["id"], c["period"]) for c in cands}
+    for u in carry or []:
+        sec, name, p = u.get("section"), u.get("勘定科目"), u.get("period")
+        rid = next((f"{sec}-{i}" for i, row in enumerate(resp.get(sec) or []) if row.get("勘定科目") == name), None)
+        if rid is None or p not in PERIODS or (rid, p) in have:
+            continue
+        if _get(resp[sec][int(rid.rsplit("-", 1)[1])], p) == u.get("after"):
+            continue
+        cands.append({"id": rid, "period": p, "value": u.get("after"), "group": f"carry-{sec}-{p}",
+                      "pdf": u.get("pdf", ""), "reason": "前の回で保留になった修正"})
+        have.add((rid, p))
 
     before = run_checks(resp)
     fail_before = _failing(before)
@@ -631,12 +701,12 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     current, merged, merge_rejected = _apply_merges(current, raw_merges, index, fail_cur)
 
     after = run_checks(current)
-    log_event("INFO", "ai_correct_done", ai_case_id=payload.get("ai_case_id"), model=model,
+    log_event("INFO", "ai_correct_done", ai_case_id=ai_case_id, model=model,
               applied=len(applied), rejected=len(rejected), unverified=len(unverified), merged=len(merged),
               checks_failed_before=len(fail_before), checks_failed_after=len(_failing(after)))
     return {
         "status": "ok",
-        "ai_case_id": payload.get("ai_case_id"),
+        "ai_case_id": ai_case_id,
         "model": model,
         "attempts": attempts,
         "response": current,
