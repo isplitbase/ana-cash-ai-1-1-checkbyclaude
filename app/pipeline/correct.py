@@ -269,36 +269,73 @@ def _parse_json(text: str) -> dict:
     return json.loads(body)
 
 
-def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str) -> Tuple[List[dict], str]:
+# Opus が利用制限・混雑などで使えないときに順に試すモデル（環境変数 CORRECT_FALLBACK_MODELS で変更可）
+FALLBACK_MODELS = [m.strip() for m in os.getenv("CORRECT_FALLBACK_MODELS", "claude-sonnet-5-5,claude-sonnet-4-6").split(",") if m.strip()]
+
+
+class AIUnavailable(Exception):
+    """どのモデルも使えなかった（利用制限・混雑・通信エラーなど）"""
+    def __init__(self, attempts: List[dict]):
+        super().__init__("どのモデルも使えませんでした")
+        self.attempts = attempts
+
+
+def log_event(severity: str, event: str, **fields) -> None:
+    """Cloud Logging で拾える形（1行 JSON・severity 付き）で標準出力に出す"""
+    print(json.dumps({"severity": severity, "event": event, **fields}, ensure_ascii=False), flush=True)
+
+
+def ask_claude(pdfs: List[Tuple[str, bytes]], read_data: str, ai_case_id=None) -> Tuple[List[dict], str, List[dict]]:
+    """修正案を出させる。戻り値は (修正案, 使ったモデル, 試したモデルの記録)。
+    利用制限（429）・混雑（529）・サーバエラー・通信エラー・時間切れのときは、SDK の自動リトライのあと次のモデルに切り替える。
+    どれも使えなければ AIUnavailable を投げる（呼び出し側は修正せずに元の読取結果を返す）。"""
     import anthropic
     api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY が設定されていません")
-    wanted = os.getenv("CORRECT_MODEL", DEFAULT_MODEL)
-    try:
-        from app.pipeline.originals.model_resolver import resolve_model
-        model = resolve_model(api_key=api_key, override=wanted)
-    except Exception:
-        model = wanted
-    client = anthropic.Anthropic(api_key=api_key)
+        raise AIUnavailable([{"model": "-", "error": "ANTHROPIC_API_KEY が設定されていません"}])
+    client = anthropic.Anthropic(api_key=api_key, max_retries=3, timeout=300)
     content = [{"type": "document", "title": name,
                 "source": {"type": "base64", "media_type": "application/pdf",
                            "data": base64.standard_b64encode(b).decode("ascii")}}
                for name, b in pdfs]
     content.append({"type": "text", "text": PROMPT.format(read_data=read_data)})
-    last_err = None
-    for _ in range(2):
-        msg = client.messages.create(model=model, max_tokens=8192,
-                                     messages=[{"role": "user", "content": content}])
-        text = "".join(b.text for b in msg.content if hasattr(b, "text"))
-        try:
-            obj = _parse_json(text)
-            corr = obj.get("corrections", [])
-            if isinstance(corr, list):
-                return corr, model
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Claude の修正案を JSON として読めませんでした: {last_err}")
+
+    models = []
+    for m in [os.getenv("CORRECT_MODEL", DEFAULT_MODEL)] + FALLBACK_MODELS:
+        if m not in models:
+            models.append(m)
+    attempts: List[dict] = []
+    for model in models:
+        for try_no in (1, 2):            # JSON が読めなかったときだけ同じモデルでもう1回
+            try:
+                msg = client.messages.create(model=model, max_tokens=8192,
+                                             messages=[{"role": "user", "content": content}])
+            except anthropic.RateLimitError as e:
+                attempts.append({"model": model, "error": "利用制限（429）", "detail": str(e)[:300]})
+                log_event("WARNING", "ai_correct_rate_limited", ai_case_id=ai_case_id, model=model)
+                break
+            except anthropic.NotFoundError as e:
+                attempts.append({"model": model, "error": "モデルが見つからない（404）", "detail": str(e)[:300]})
+                log_event("WARNING", "ai_correct_model_not_found", ai_case_id=ai_case_id, model=model)
+                break
+            except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                code = getattr(e, "status_code", None)
+                label = "混雑（529）" if code == 529 else f"API エラー（{code}）" if code else type(e).__name__
+                attempts.append({"model": model, "error": label, "detail": str(e)[:300]})
+                log_event("WARNING", "ai_correct_api_error", ai_case_id=ai_case_id, model=model, error=label)
+                break
+            text = "".join(b.text for b in msg.content if hasattr(b, "text"))
+            try:
+                corr = _parse_json(text).get("corrections", [])
+                if isinstance(corr, list):
+                    if attempts:
+                        log_event("WARNING", "ai_correct_fallback_used", ai_case_id=ai_case_id, model=model, attempts=attempts)
+                    return corr, model, attempts
+                raise ValueError("corrections が配列ではない")
+            except Exception as e:
+                attempts.append({"model": model, "error": "JSON が読めない", "detail": str(e)[:300]})
+    log_event("ERROR", "ai_correct_unavailable", ai_case_id=ai_case_id, attempts=attempts)
+    raise AIUnavailable(attempts)
 
 
 # ------------------------------------------------------------
@@ -345,7 +382,14 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="correct_") as td:
         pdfs = _download_pdfs(pdfurls, Path(td))
     read_data, index = _compact(resp)
-    raw, model = ask_claude(pdfs, read_data)
+    try:
+        raw, model, attempts = ask_claude(pdfs, read_data, payload.get("ai_case_id"))
+    except AIUnavailable as e:
+        # AI が使えなかったときはエラーにせず、修正しないまま返す（読取はそのまま続けられる）
+        return {"status": "skipped", "ai_case_id": payload.get("ai_case_id"),
+                "message": "AI が使えなかったため、読取結果は修正していません",
+                "attempts": e.attempts, "response": resp, "applied": [], "rejected": [], "unverified": [],
+                "created_at": datetime.now(timezone.utc).isoformat()}
 
     # 形の正しい修正案だけ残す（存在する行・期、整数か null、今と違う値）
     cands = []
@@ -397,10 +441,14 @@ def correct_response(payload: Dict[str, Any]) -> Dict[str, Any]:
         unverified += [_describe(c, current, index) for c in items]
 
     after = run_checks(current)
+    log_event("INFO", "ai_correct_done", ai_case_id=payload.get("ai_case_id"), model=model,
+              applied=len(applied), rejected=len(rejected), unverified=len(unverified),
+              checks_failed_before=len(fail_before), checks_failed_after=len(_failing(after)))
     return {
         "status": "ok",
         "ai_case_id": payload.get("ai_case_id"),
         "model": model,
+        "attempts": attempts,
         "response": current,
         "applied": applied,
         "rejected": rejected,
