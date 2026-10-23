@@ -275,31 +275,10 @@ def num(v):
         return 0
     return int(str(v).replace(",", ""))
 
-import unicodedata
-
-# 科目名の別の書き方（_norm() で表記をそろえたあとに比べる）
-ALIASES = {
-    "税引前当期純利益": ["税引前当期利益", "税金等調整前当期純利益", "税引前当期純損益"],
-    "法人税及び住民税": ["法人税住民税及び事業税"],
-    "当期純利益": ["当期利益", "当期純損益"],
-    "経常利益": ["経常損益"],
-    "営業利益": ["営業損益"],
-}
-
-def _norm(name):
-    """科目名の表記ゆれをそろえる（全角半角・空白・【】・句読点・「(損失)」・末尾の「金額」）"""
-    s = unicodedata.normalize("NFKC", str(name))
-    s = re.sub(r"[(（][^)）]*損失[^)）]*[)）]", "", s)
-    s = re.sub(r"[\s【】\[\]()（）、・,]", "", s)
-    return re.sub(r"金額$", "", s)
-
 def get(section_data, name, period):
-    """指定科目・期のJSON金額を取得（科目名は _norm() でそろえて比べる。2026-10-23）
-    「経常利益金額」「【特別損失】」「法人税、住民税及び事業税」のような書き方でも見つけられるようにした。
-    これまでは完全一致のみで、見つからない科目の検算は黙って飛ばされていた。"""
-    targets = {_norm(n) for n in [name] + ALIASES.get(name, [])}
+    """指定科目・期のJSON金額を取得"""
     for row in section_data:
-        if _norm(row["勘定科目"]) in targets:
+        if row["勘定科目"] == name:
             return num(row[period]["金額"])
     return None
 
@@ -327,61 +306,25 @@ print("\n" + "=" * 60)
 print("  Agent1: PDF読取チェック（Claude API）")
 print("=" * 60)
 
-# 読取データ（OCR結果）を、照合しやすい形（科目名と各期の金額だけ）にして Agent1 に渡す（2026-10-23）
-def _compact_rows(section_data):
-    rows = []
-    for row in section_data:
-        item = {"勘定科目": row.get("勘定科目", "")}
-        for p in PERIODS:
-            v = row.get(p, "")
-            item[p] = v.get("金額", "") if isinstance(v, dict) else v
-        rows.append(item)
-    return rows
+AGENT1_PROMPT = f"""あなたはPDF読取品質の検査員です。
+添付された決算書PDFを見て、以下のみをチェックしてください。
 
-read_data_for_agent1 = json.dumps(
-    {k: _compact_rows(v) for k, v in json_data.items() if v},
-    ensure_ascii=False, indent=1
-)
-
-AGENT1_PROMPT = f"""あなたは決算書の読取結果の検査員です。
-添付された決算書PDFと、下の「読取データ」（PDFをOCRで読み取った結果）を見て、次の2つをチェックしてください。
-
-## チェック1：PDFの読取品質（kind: "quality"）
+## チェック対象（読取品質のみ）
 - PDF画像の鮮明度・傾き・ノイズ
 - 文字の潰れ・かすれ・影による読みにくさ
 - 墨消し（黒塗り）の範囲と読取への影響
 - スキャン品質として問題のある箇所
 
-## チェック2：PDFと読取データの照合（kind: "transcription"）
-貸借対照表・損益計算書・販売費及び一般管理費・製造原価報告書のページについて、PDFに書かれている金額と読取データを科目ごと・期ごとに見比べ、次のものを挙げてください。
-- 読取漏れ：PDFに金額が書かれているのに、読取データでは空欄・0・科目そのものが無いもの
-- 読み違い：PDFと読取データで金額が違うもの（桁・符号（△・▲）を含む）
-照合のルール:
-- 期は決算日で判断する。「今期」が最も新しい決算期、「前期」がその1つ前、「前々期」がさらに1つ前。PDFが複数あるときは、どのPDFがどの期かを決算日で見分ける。
-- 【特別損失】のような見出しの行に金額が書かれておらず、明細の行（固定資産廃棄損など）の右の列に金額がある場合は、その金額を見出しの合計として扱う。読取データの見出しの行が空欄なら読取漏れとする。
-- 「1,000」と「1000」、全角・半角、科目名の書き方（「売上総利益金額」と「売上総利益」など）だけの違いは挙げない。
-- 株主資本等変動計算書・個別注記表など、上の4種類以外のページは照合しない。
-- PDFが読めず判断できない箇所は level:"warn" にし、推測で金額を書かない。
-- PDFが1つも添付されていない場合は、チェック1・2とも行わず items を空の配列にする。
-- 読取漏れ・読み違いは level:"error"、title は「【前期】特別損失の読取漏れ」のように期と科目を入れ、detail に「PDF：4／読取データ：空欄」のように両方の値を書く。
-- 照合して問題が無かった場合は、level:"ok"・kind:"transcription" の項目を1つだけ出す（title「PDFと読取データの照合」）。
-
 ## 絶対に含めないこと
+- 数値の検算・計算の正誤チェック
 - 前期比・増減率などのコメント
 - 財務内容に関する意見
-- 合計の検算（別の担当が計算で確認する）
-
-## 読取データ
-```json
-{read_data_for_agent1}
-```
 
 ## 出力形式（JSON形式のみ・他のテキスト不可）
 ```json
 {{
   "items": [
     {{
-      "kind": "quality" or "transcription",
       "level": "ok" or "warn" or "error",
       "title": "チェック項目名",
       "detail": "1文で簡潔に"
@@ -402,7 +345,7 @@ agent1_blocks.append({"type": "text", "text": AGENT1_PROMPT})
 
 def _create_agent1():
     return client.messages.create(
-        model=MODEL, max_tokens=8192,   # 照合結果が増えるため 2048 → 8192（2026-10-23）
+        model=MODEL, max_tokens=2048,
         messages=[{"role": "user", "content": agent1_blocks}]
     )
 
@@ -442,22 +385,8 @@ def check(title, calc_val, json_val, period, detail_ok="", detail_ng=""):
             "values": {"計算値": f"{calc_val:,}", "読取値": f"{json_val:,}"}
         }
 
-# データが1つも無い期（1期分だけの決算書の前期・前々期など）は検算しない（2026-10-23）
-# これまでは全部0どうしで「一致確認済み」と出ていた
-def _period_has_data(p):
-    for row in list(bs) + list(pl):
-        try:
-            v = row[p]["金額"] if isinstance(row.get(p), dict) else row.get(p)
-            if num(v) != 0:
-                return True
-        except (ValueError, TypeError):
-            return True   # 数値にできない値がある期は、データありとして扱う（データ型チェックで拾う）
-    return False
-
 # --- BS検算 ---
 for p in PERIODS:
-    if not _period_has_data(p):
-        continue
     # 資産合計 = 負債合計 + 純資産合計
     sisan   = get(bs, "資産合計", p)
     fusai   = get(bs, "負債合計", p)
@@ -492,8 +421,6 @@ for p in PERIODS:
 
 # --- PL検算 ---
 for p in PERIODS:
-    if not _period_has_data(p):
-        continue
     uritage  = get(pl, "売上高", p)
     genka    = get(pl, "売上原価", p)
     souri    = get(pl, "売上総利益", p)
@@ -507,19 +434,6 @@ for p in PERIODS:
     zeimai   = get(pl, "税引前当期純利益", p)
     zeikin   = get(pl, "法人税及び住民税", p)
     junri    = get(pl, "当期純利益", p)
-
-    # 特別利益・特別損失の行が無い会社もあるので、経常利益と税引前利益があれば 0 として検算する（2026-10-23）
-    if keijo is not None and zeimai is not None:
-        tokuri = tokuri if tokuri is not None else 0
-        tokuson = tokuson if tokuson is not None else 0
-    # 「法人税等」（合計）があればそれを使い、無ければ「法人税、住民税及び事業税」に法人税等調整額を足す
-    # （当期純利益 = 税引前 − 法人税、住民税及び事業税 − 法人税等調整額）
-    zeikin_total = get(pl, "法人税等", p)
-    chousei = get(pl, "法人税等調整額", p)
-    if zeikin_total is not None:
-        zeikin = zeikin_total
-    elif zeikin is not None and chousei is not None:
-        zeikin = zeikin + chousei
 
     if all(v is not None for v in [uritage, genka, souri]):
         agent2_items.append(check("PL売上総利益（売上高-売上原価）",
@@ -611,7 +525,7 @@ agent1_summary = json.dumps(agent1_result, ensure_ascii=False, indent=2)
 AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 以下の2つのエージェントの結果を統合し、最終チェック結果を作成してください。
 
-## Agent1の結果（PDF読取品質チェック kind:"quality" と、PDFと読取データの照合 kind:"transcription"）
+## Agent1の結果（PDF読取品質チェック）
 ```json
 {agent1_summary}
 ```
@@ -622,17 +536,12 @@ AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 ```
 
 ## 統合ルール（厳守）
-1. Agent2が「error」と判定した項目は必ずerrorとして残すこと
-2. Agent2の計算結果が「一致（ok）」の項目は ok のままにすること（Agent1の品質チェックの「計算が合わない」等の指摘で ok を覆さない）
-3. Agent1の kind:"quality"（PDF品質）の指摘はそのまま採用してよい
-4. Agent1の kind:"transcription"（PDFと読取データの照合）の指摘は、Agent2の検算結果と突き合わせて判断すること:
-   a. Agent2のerrorと同じ期で、その差額をAgent1の読取漏れ・読み違いの金額で説明できる場合（例：差額 −545,449 ＝ 特別利益の読取漏れ 545,453 − 特別損失の読取漏れ 4）は、照合の指摘を error とし、Agent2のerrorの detail にも「原因：前期の特別利益 545,453 と特別損失 4 の読取漏れ（PDFとの照合）」のように原因を書き添えること
-   b. Agent2の検算と矛盾しない（関係する検算が無い、または検算では見つからない種類の）読取漏れ・読み違いは error のまま残すこと
-   c. 照合の指摘の金額を当てはめると、Agent2で ok だった検算が合わなくなる場合は、照合の指摘の方が誤りの可能性が高いので warn に下げ、detail に「検算は一致しているため要確認」と書くこと
-   d. 根拠の金額（PDFの値と読取データの値）が書かれていない照合の指摘は warn にすること
-5. 「計算は合っているが〜」「一致しているが〜」という理由の warn は全て ok に変更すること（4c を除く）
-6. 前期比・増減率・経営判断コメントは一切含めないこと
-7. warn/errorは「実際に数値が食い違っている、または読取漏れがある」場合のみ使用すること
+1. Agent2の計算結果が「一致（ok）」の項目について、Agent1が「不一致・要確認」と言っている場合は **Agent2を優先** してokにすること
+2. Agent2が「error」と判定した項目は必ずerrorとして残すこと
+3. Agent1のPDF品質指摘はそのまま採用してよい（計算と無関係なため）
+4. 「計算は合っているが〜」「一致しているが〜」という理由のwarnは全てokに変更すること
+5. 前期比・増減率・経営判断コメントは一切含めないこと
+6. warn/errorは「実際に数値が食い違っている」場合のみ使用すること
 
 ## 出力形式（JSON形式のみ・他テキスト不可）
 ```json
@@ -661,8 +570,7 @@ AGENT3_PROMPT = f"""あなたは決算書チェックの最終判定者です。
 ```
 
 セクション構成:
-1. id:"pdf_quality"         PDF品質チェック（Agent1の kind:"quality" の結果）
-1b. id:"transcription_check" PDFと読取データの照合（Agent1の kind:"transcription" の結果。統合ルール4で判断したもの。指摘が無い場合も ok の項目を1つ入れる。PDFが無く照合していない場合はこのセクションを出さない）
+1. id:"pdf_quality"         PDF品質チェック（Agent1の結果）
 2. id:"bs_check"            貸借対照表の検算（Agent2の結果）
 3. id:"pl_check"            損益計算書の検算（Agent2の結果）
 4. id:"manufacturing_check" 製造原価報告書の検算（Agent2の結果）
