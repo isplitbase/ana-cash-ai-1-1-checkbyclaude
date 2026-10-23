@@ -37,7 +37,7 @@ def _norm(name: Any) -> str:
     """科目名の表記ゆれをそろえる（全角半角・空白・【】・句読点・「(損失)」・末尾の「金額」）"""
     s = unicodedata.normalize("NFKC", str(name or ""))
     s = re.sub(r"[(（][^)）]*損失[^)）]*[)）]", "", s)
-    s = re.sub(r"[\s【】\[\]()（）、・,]", "", s)
+    s = re.sub(r"[\s【】\[\]()（）、・,*＊]", "", s)
     s = re.sub(r"金額$", "", s)
     return s
 
@@ -157,11 +157,14 @@ def run_checks(resp: dict) -> Dict[str, bool]:
             add(f"【{p}】BS:利益剰余金＝利益準備金＋その他利益剰余金", legal + other_re, retained)
         carried = g(bs, "繰越利益剰余金")
         if None not in (other_re, carried):
-            # その他利益剰余金 ＝ 任意積立金（〜積立金・利益準備金以外の〜準備金）＋ 繰越利益剰余金
-            reserves = [_get(r, p) for r in bs
-                        if re.search(r"(積立金|準備金)$", _norm(r.get("勘定科目")))
-                        and _norm(r.get("勘定科目")) not in ("利益準備金", "資本準備金")]
-            add(f"【{p}】BS:その他利益剰余金＝積立金＋繰越利益剰余金", sum(v or 0 for v in reserves) + carried, other_re)
+            # その他利益剰余金 ＝ 任意積立金（その他利益剰余金と繰越利益剰余金の行の間にある〜積立金・〜準備金）＋ 繰越利益剰余金
+            # 資産の「投資信託積立金」などを拾わないよう、行の位置で絞る
+            r_from, r_to = _find(bs, "その他利益剰余金"), _find(bs, "繰越利益剰余金")
+            i_from, i_to = bs.index(r_from), bs.index(r_to)
+            if i_from < i_to:
+                reserves = [_get(r, p) for r in bs[i_from + 1:i_to]
+                            if re.search(r"(積立金|準備金)$", _norm(r.get("勘定科目")))]
+                add(f"【{p}】BS:その他利益剰余金＝積立金＋繰越利益剰余金", sum(v or 0 for v in reserves) + carried, other_re)
 
         # 3) PL の利益の流れ
         sales, cogs, gross = g(pl, "売上高"), g(pl, "売上原価"), g(pl, "売上総利益")
@@ -179,9 +182,13 @@ def run_checks(resp: dict) -> Dict[str, bool]:
         #     合計 ＝ 期首棚卸 ＋ 仕入（リベート等の控除を含む）＋ 当期製品製造原価
         begin = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期首")), None)
         end = next((r for r in pl if _norm(r.get("勘定科目")).startswith("期末")), None)
-        subtotal = _find(pl, "合計", "売上原価合計")
-        if cogs is not None and end is not None and subtotal is not None and None not in (_get(end, p), _get(subtotal, p)):
-            add(f"【{p}】PL:売上原価＝合計−期末棚卸", _get(subtotal, p) - _get(end, p), cogs)
+        # 合計の行は期ごとに名前が分かれていることがある（「＊＊合計＊＊」「合計」「合計（仕入）」）ので、この期に値がある行を使う
+        subtotal = next((r for r in pl if _norm(r.get("勘定科目")) in ("合計", "合計仕入", "売上原価合計") and _get(r, p) is not None), None)
+        # 建設業などは「兼業売上原価」が 期首＋仕入−期末 になる
+        cogs_flow = g(pl, "売上原価") if g(pl, "売上原価") is not None else g(pl, "兼業売上原価")
+        if cogs_flow is not None and end is not None and subtotal is not None and None not in (_get(end, p), _get(subtotal, p)):
+            # 期末棚卸は △ 付き（マイナス）で書く決算書もあるので、大きさで差し引く
+            add(f"【{p}】PL:売上原価＝合計−期末棚卸", _get(subtotal, p) - abs(_get(end, p)), cogs_flow)
         if begin is not None and end is not None and subtotal is not None and _get(subtotal, p) is not None:
             i0, i1 = pl.index(begin), pl.index(subtotal)
             if i0 < i1:
